@@ -1,15 +1,20 @@
-// Command llm-server runs the Supervisor daemon.
+// Command llm-server runs the Supervisor daemon or utility subcommands.
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/TanKaizokuO/llm-server/internal/gguf"
 	"github.com/TanKaizokuO/llm-server/internal/httpserve"
 	"github.com/TanKaizokuO/llm-server/internal/supervisor"
 )
@@ -21,16 +26,68 @@ import (
 const defaultAddr = "127.0.0.1:11434"
 
 func main() {
-	addr := flag.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
-	flag.Parse()
-
-	if err := run(context.Background(), *addr); err != nil {
-		slog.Error("supervisor failed", "err", err)
+	if err := runCLI(context.Background(), os.Args, os.Stdout); err != nil {
+		slog.Error("command failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(parentCtx context.Context, addr string) error {
+func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
+	if len(args) > 1 && args[1] == "inspect" {
+		return runInspect(args[2:], stdout)
+	}
+
+	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	addr := fs.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	return runServer(parentCtx, *addr)
+}
+
+func runInspect(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "output metadata as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if fs.NArg() < 1 {
+		return errors.New("usage: llm-server inspect [-json] <file.gguf>")
+	}
+
+	filePath := fs.Arg(0)
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("opening GGUF file: %w", err)
+	}
+	defer f.Close()
+
+	hdr, err := gguf.ReadHeader(bufio.NewReader(f))
+	if err != nil {
+		return fmt.Errorf("reading GGUF metadata: %w", err)
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(hdr.Metadata)
+	}
+
+	fmt.Fprintf(stdout, "Architecture:   %s\n", hdr.Metadata.Architecture)
+	fmt.Fprintf(stdout, "Context Length: %d\n", hdr.Metadata.ContextLength)
+	fmt.Fprintf(stdout, "Quantization:   %s\n", hdr.Metadata.Quantization)
+	return nil
+}
+
+func runServer(parentCtx context.Context, addr string) error {
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
