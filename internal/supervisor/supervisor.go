@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -214,19 +215,52 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, param, code st
 	})
 }
 
-func (s *Supervisor) resolveModel(ref string) (Model, bool) {
+// ModelNotFoundError indicates that a requested model reference did not match any discovered model.
+type ModelNotFoundError struct {
+	Ref string
+}
+
+func (e *ModelNotFoundError) Error() string {
+	return fmt.Sprintf("model %q not found", e.Ref)
+}
+
+// AmbiguousModelError indicates that a bare model name matches multiple discovered quantisations.
+type AmbiguousModelError struct {
+	Name string
+	Tags []string
+}
+
+func (e *AmbiguousModelError) Error() string {
+	return fmt.Sprintf("model %q is ambiguous; available tags: %s", e.Name, strings.Join(e.Tags, ", "))
+}
+
+func (s *Supervisor) resolveModel(ref string) (Model, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if m, ok := s.models[ref]; ok {
-		return m, true
+		return m, nil
 	}
+
+	var matches []Model
 	for _, m := range s.modelsList {
 		if m.Name == ref {
-			return m, true
+			matches = append(matches, m)
 		}
 	}
-	return Model{}, false
+
+	if len(matches) == 0 {
+		return Model{}, &ModelNotFoundError{Ref: ref}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+
+	tags := make([]string, 0, len(matches))
+	for _, m := range matches {
+		tags = append(tags, m.Tag)
+	}
+	return Model{}, &AmbiguousModelError{Name: ref, Tags: tags}
 }
 
 func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -243,9 +277,16 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	model, ok := s.resolveModel(req.Model)
-	if !ok {
-		writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", req.Model), "model", "model_not_found")
+	model, err := s.resolveModel(req.Model)
+	if err != nil {
+		var notFound *ModelNotFoundError
+		var ambiguous *AmbiguousModelError
+		switch {
+		case errors.As(err, &notFound):
+			writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", notFound.Ref), "model", "model_not_found")
+		case errors.As(err, &ambiguous):
+			writeOpenAIError(w, http.StatusBadRequest, ambiguous.Error(), "model", "model_ambiguous")
+		}
 		return
 	}
 

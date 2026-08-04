@@ -441,3 +441,110 @@ func TestV1ChatCompletions_RequestCancellationPropagatesToInstance(t *testing.T)
 		t.Fatal("timed out waiting for instance context cancellation")
 	}
 }
+func TestModelResolution_ExactNameTagResolvesWhenMultipleQuantisationsExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+	pathQ8 := writeTestGGUF(t, tmpDir, "llama-3-8b.q8_0.gguf", "llama", "Q8_0")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+
+	body := `{"model":"llama-3-8b:q8_0","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	launches := fakeHost.Launches()
+	if len(launches) != 1 {
+		t.Fatalf("expected 1 Host launch, got %d", len(launches))
+	}
+	wantArgv := []string{"llama-server", "-m", pathQ8, "-c", "4096", "-np", "1"}
+	gotArgv := launches[0]
+	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
+		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+func TestModelResolution_BareNameResolvesWhenUnambiguous(t *testing.T) {
+	tmpDir := t.TempDir()
+	pathQ4 := writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	launches := fakeHost.Launches()
+	if len(launches) != 1 {
+		t.Fatalf("expected 1 Host launch, got %d", len(launches))
+	}
+	wantArgv := []string{"llama-server", "-m", pathQ4, "-c", "4096", "-np", "1"}
+	gotArgv := launches[0]
+	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
+		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+func TestModelResolution_BareNameReturnsErrorWhenAmbiguous(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q8_0.gguf", "llama", "Q8_0")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decoding error response: %v", err)
+	}
+
+	if errResp.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type = %q, want %q", errResp.Error.Type, "invalid_request_error")
+	}
+	if errResp.Error.Param != "model" {
+		t.Errorf("error.param = %q, want %q", errResp.Error.Param, "model")
+	}
+	if errResp.Error.Code != "model_ambiguous" {
+		t.Errorf("error.code = %q, want %q", errResp.Error.Code, "model_ambiguous")
+	}
+	if !strings.Contains(errResp.Error.Message, "llama-3-8b") {
+		t.Errorf("error.message = %q, want containing model name 'llama-3-8b'", errResp.Error.Message)
+	}
+	if !strings.Contains(errResp.Error.Message, "q4_k_m") || !strings.Contains(errResp.Error.Message, "q8_0") {
+		t.Errorf("error.message = %q, want containing tags 'q4_k_m' and 'q8_0'", errResp.Error.Message)
+	}
+
+	if len(fakeHost.Launches()) != 0 {
+		t.Errorf("expected 0 Host launches for ambiguous model reference, got %d", len(fakeHost.Launches()))
+	}
+}
