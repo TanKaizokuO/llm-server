@@ -49,6 +49,7 @@ const (
 	maxKVCount      = 100_000          // max key-value pair count
 	maxArrayDepth   = 8                // max array nesting depth
 )
+
 var FileTypeNames = map[uint32]string{
 	0:  "F32",
 	1:  "F16",

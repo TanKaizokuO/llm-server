@@ -13,20 +13,22 @@ for why this shape was chosen.
 
 ## Status
 
-**In active development.** Ticket #3 (Supervisor binary bootstrap and health endpoint) is complete. Subprocess supervision, discovery, empirical tuning, and HTTP API surfaces are in progress across tracked issues (#4–#19).
+**In active development.** Tickets #3, #4, and #5 (Supervisor bootstrap, GGUF metadata reader, model discovery, and `/api/tags` & `/v1/models` list surfaces) are complete. Subprocess supervision, empirical tuning, and completion API surfaces are in progress across tracked issues (#6–#19).
 
 ## Build and run
 
 ```sh
 CGO_ENABLED=0 go build -o llm-server ./cmd/llm-server
-./llm-server -addr 127.0.0.1:11434
+./llm-server -addr 127.0.0.1:11434 /path/to/models
 ```
 
-`GET /health` reports readiness of the daemon itself, independently of whether
-any Model is loaded.
+- `GET /health` reports readiness of the daemon itself.
+- `GET /api/tags` lists discovered Models in Ollama format.
+- `GET /v1/models` lists discovered Models in OpenAI format.
+- `llm-server inspect [-json] <file.gguf>` displays GGUF metadata header fields.
 
 ## Tests
 
 ```sh
-go test ./...
+go test -race ./...
 ```

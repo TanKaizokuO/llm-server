@@ -46,7 +46,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr)
+	return runServer(parentCtx, *addr, fs.Args()...)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -87,11 +87,19 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr string) error {
+func runServer(parentCtx context.Context, addr string, dirs ...string) error {
+	if len(dirs) == 0 {
+		dirs = []string{"."}
+	}
+	sup, err := supervisor.New(dirs...)
+	if err != nil {
+		return fmt.Errorf("initialising supervisor: %w", err)
+	}
+
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := httpserve.Listen(addr, supervisor.New().Handler())
+	srv, err := httpserve.Listen(addr, sup.Handler())
 	if err != nil {
 		return fmt.Errorf("initialising server: %w", err)
 	}

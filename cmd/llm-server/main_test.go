@@ -14,10 +14,27 @@ import (
 	"github.com/TanKaizokuO/llm-server/internal/gguf"
 )
 
+func createTestModelFile(t *testing.T, dir, filename string) string {
+	t.Helper()
+	path := filepath.Join(dir, filename)
+	data := gguf.CreateTestGGUF(gguf.FixtureParams{
+		Architecture:  "llama",
+		ContextLength: 4096,
+		Quantization:  "Q4_K_M",
+	})
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("writing test GGUF: %v", err)
+	}
+	return path
+}
+
 func TestRunGracefulShutdownOnSignal(t *testing.T) {
+	tmpDir := t.TempDir()
+	createTestModelFile(t, tmpDir, "test-model.gguf")
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), "127.0.0.1:0")
+		errCh <- runServer(context.Background(), "127.0.0.1:0", tmpDir)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -38,9 +55,23 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 }
 
 func TestRunFailsOnInvalidAddress(t *testing.T) {
-	err := runServer(context.Background(), "invalid-address-format:99999999")
+	tmpDir := t.TempDir()
+	createTestModelFile(t, tmpDir, "test-model.gguf")
+
+	err := runServer(context.Background(), "invalid-address-format:99999999", tmpDir)
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
+	}
+}
+
+func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
+	emptyDir := t.TempDir()
+	err := runServer(context.Background(), "127.0.0.1:0", emptyDir)
+	if err == nil {
+		t.Fatal("expected error when no models found, got nil")
+	}
+	if !strings.Contains(err.Error(), "no models found") {
+		t.Errorf("err = %v, want error containing 'no models found'", err)
 	}
 }
 

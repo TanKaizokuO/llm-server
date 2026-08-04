@@ -172,7 +172,7 @@ func TestReadHeader_DeeplyNestedArray(t *testing.T) {
 	for range 10 {
 		_ = binary.Write(buf, binary.LittleEndian, uint32(gguf.TypeArray))
 		_ = binary.Write(buf, binary.LittleEndian, uint32(gguf.TypeArray)) // elemType = TypeArray
-		_ = binary.Write(buf, binary.LittleEndian, uint64(1))               // count = 1
+		_ = binary.Write(buf, binary.LittleEndian, uint64(1))              // count = 1
 	}
 
 	_, err := gguf.ReadHeader(buf)
