@@ -9,24 +9,38 @@
 package supervisor
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httputil"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/TanKaizokuO/llm-server/internal/host"
 )
 
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // and, in later work, the Instance registry and the Tuning cache.
 type Supervisor struct {
 	mu         sync.RWMutex
+	host       host.Host
 	models     map[string]Model
 	modelsList []Model
+	instances  map[string]host.Instance
 }
 
 // New builds a Supervisor by scanning the configured directories for Models.
-// It returns an error if no valid Models are found in any scan directory.
-func New(dirs ...string) (*Supervisor, error) {
+// Host is the single injected boundary in the system representing physical hardware.
+// If h is nil, a default real Host is used.
+func New(h host.Host, dirs ...string) (*Supervisor, error) {
+	if h == nil {
+		h = host.New()
+	}
 	models, err := discoverModels(dirs)
 	if err != nil {
 		return nil, err
@@ -41,8 +55,10 @@ func New(dirs ...string) (*Supervisor, error) {
 	}
 
 	return &Supervisor{
+		host:       h,
 		models:     modelMap,
 		modelsList: models,
+		instances:  make(map[string]host.Instance),
 	}, nil
 }
 
@@ -53,7 +69,29 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /api/tags", s.handleAPITags)
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
+	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
 	return mux
+}
+
+// Close stops all resident Instances supervised by the daemon.
+func (s *Supervisor) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var errs []error
+	for id, inst := range s.instances {
+		if err := inst.Stop(stopCtx); err != nil {
+			errs = append(errs, fmt.Errorf("stopping instance %s: %w", id, err))
+		}
+	}
+	s.instances = make(map[string]host.Instance)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 // handleHealth reports that the Supervisor process itself is up and able to
@@ -65,17 +103,17 @@ func (s *Supervisor) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type ollamaModelDetails struct {
-	Format            string   `json:"format"`
-	Family            string   `json:"family"`
-	Families          []string `json:"families,omitempty"`
-	ParameterSize     string   `json:"parameter_size"`
-	QuantizationLevel string   `json:"quantization_level"`
+	Format            string `json:"format"`
+	Family            string `json:"family"`
+	Families          any    `json:"families"`
+	ParameterSize     string `json:"parameter_size"`
+	QuantizationLevel string `json:"quantization_level"`
 }
 
 type ollamaModel struct {
 	Name       string             `json:"name"`
 	Model      string             `json:"model"`
-	ModifiedAt string             `json:"modified_at"`
+	ModifiedAt time.Time          `json:"modified_at"`
 	Size       int64              `json:"size"`
 	Digest     string             `json:"digest"`
 	Details    ollamaModelDetails `json:"details"`
@@ -90,25 +128,28 @@ func (s *Supervisor) handleAPITags(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsList
 	s.mu.RUnlock()
 
-	list := make([]ollamaModel, 0, len(models))
+	res := ollamaTagsResponse{
+		Models: make([]ollamaModel, 0, len(models)),
+	}
+
 	for _, m := range models {
-		list = append(list, ollamaModel{
+		res.Models = append(res.Models, ollamaModel{
 			Name:       m.ID,
 			Model:      m.ID,
-			ModifiedAt: m.ModTime.UTC().Format(time.RFC3339),
+			ModifiedAt: m.ModTime,
 			Size:       m.Size,
 			Digest:     m.Digest,
 			Details: ollamaModelDetails{
 				Format:            "gguf",
 				Family:            m.Architecture,
-				Families:          []string{m.Architecture},
+				Families:          nil,
 				ParameterSize:     "",
 				QuantizationLevel: m.Quantization,
 			},
 		})
 	}
 
-	writeJSON(w, http.StatusOK, ollamaTagsResponse{Models: list})
+	writeJSON(w, http.StatusOK, res)
 }
 
 type openAIModel struct {
@@ -128,9 +169,13 @@ func (s *Supervisor) handleV1Models(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsList
 	s.mu.RUnlock()
 
-	list := make([]openAIModel, 0, len(models))
+	res := openAIModelsResponse{
+		Object: "list",
+		Data:   make([]openAIModel, 0, len(models)),
+	}
+
 	for _, m := range models {
-		list = append(list, openAIModel{
+		res.Data = append(res.Data, openAIModel{
 			ID:      m.ID,
 			Object:  "model",
 			Created: m.ModTime.Unix(),
@@ -138,10 +183,147 @@ func (s *Supervisor) handleV1Models(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, http.StatusOK, openAIModelsResponse{
-		Object: "list",
-		Data:   list,
+	writeJSON(w, http.StatusOK, res)
+}
+
+type openAIChatCompletionRequest struct {
+	Model string `json:"model"`
+}
+
+type openAIErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Param   string `json:"param"`
+	Code    string `json:"code"`
+}
+
+type openAIErrorResponse struct {
+	Error openAIErrorDetail `json:"error"`
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, message, param, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(openAIErrorResponse{
+		Error: openAIErrorDetail{
+			Message: message,
+			Type:    "invalid_request_error",
+			Param:   param,
+			Code:    code,
+		},
 	})
+}
+
+func (s *Supervisor) resolveModel(ref string) (Model, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if m, ok := s.models[ref]; ok {
+		return m, true
+	}
+	for _, m := range s.modelsList {
+		if m.Name == ref {
+			return m, true
+		}
+	}
+	return Model{}, false
+}
+
+func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "", "invalid_request")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	var req openAIChatCompletionRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil || req.Model == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid request body", "model", "invalid_request")
+		return
+	}
+
+	model, ok := s.resolveModel(req.Model)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", req.Model), "model", "model_not_found")
+		return
+	}
+
+	inst, err := s.getOrLaunchInstance(r.Context(), model)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "", "internal_error")
+		return
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(inst.URL())
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("proxy error: %v", err), "", "bad_gateway")
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Instance, error) {
+	s.mu.Lock()
+	inst, ok := s.instances[m.ID]
+	if ok && inst != nil {
+		select {
+		case <-inst.Done():
+			delete(s.instances, m.ID)
+			inst = nil
+		default:
+			s.mu.Unlock()
+			return inst, nil
+		}
+	}
+	s.mu.Unlock()
+
+	ctxLen := m.ContextLength
+	if ctxLen == 0 {
+		ctxLen = 2048
+	}
+	argv := []string{
+		"llama-server",
+		"-m", m.Path,
+		"-c", strconv.FormatUint(ctxLen, 10),
+		"-np", "1",
+	}
+
+	newInst, err := s.host.Launch(context.Background(), argv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to launch instance: %w", err)
+	}
+
+	if err := newInst.WaitReady(ctx); err != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = newInst.Stop(stopCtx)
+		return nil, fmt.Errorf("instance failed readiness: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.instances[m.ID]; ok && existing != nil {
+		select {
+		case <-existing.Done():
+		default:
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = newInst.Stop(stopCtx)
+			return existing, nil
+		}
+	}
+
+	s.instances[m.ID] = newInst
+	return newInst, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

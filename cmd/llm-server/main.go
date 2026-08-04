@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/TanKaizokuO/llm-server/internal/gguf"
+	"github.com/TanKaizokuO/llm-server/internal/host"
 	"github.com/TanKaizokuO/llm-server/internal/httpserve"
 	"github.com/TanKaizokuO/llm-server/internal/supervisor"
 )
@@ -91,11 +92,12 @@ func runServer(parentCtx context.Context, addr string, dirs ...string) error {
 	if len(dirs) == 0 {
 		dirs = []string{"."}
 	}
-	sup, err := supervisor.New(dirs...)
+	h := host.New()
+	sup, err := supervisor.New(h, dirs...)
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)
 	}
-
+	defer func() { _ = sup.Close() }()
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

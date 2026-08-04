@@ -1,6 +1,8 @@
 package supervisor_test
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/TanKaizokuO/llm-server/internal/gguf"
+	"github.com/TanKaizokuO/llm-server/internal/host"
 	"github.com/TanKaizokuO/llm-server/internal/supervisor"
 )
 
@@ -37,24 +41,28 @@ func writeTestGGUF(t *testing.T, dir, filename, arch, quant string, extraKV ...m
 	return path
 }
 
-func newTestServer(t *testing.T, dirs ...string) *httptest.Server {
+func newTestServer(t *testing.T, dirs ...string) (*httptest.Server, *host.FakeHost) {
 	t.Helper()
+	fakeHost := host.NewFakeHost()
 	if len(dirs) == 0 {
 		tmpDir := t.TempDir()
 		writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 		dirs = []string{tmpDir}
 	}
-	s, err := supervisor.New(dirs...)
+	s, err := supervisor.New(fakeHost, dirs...)
 	if err != nil {
 		t.Fatalf("supervisor.New failed: %v", err)
 	}
 	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(srv.Close)
-	return srv
+	t.Cleanup(func() {
+		srv.Close()
+		_ = s.Close()
+	})
+	return srv, fakeHost
 }
 
 func TestHealthReportsReadyWithNoModelLoaded(t *testing.T) {
-	srv := newTestServer(t)
+	srv, _ := newTestServer(t)
 
 	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
@@ -80,7 +88,7 @@ func TestHealthReportsReadyWithNoModelLoaded(t *testing.T) {
 func TestDiscovery_RefusesToStartWhenNoModelsFound(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	_, err := supervisor.New(tmpDir)
+	_, err := supervisor.New(host.NewFakeHost(), tmpDir)
 	if err == nil {
 		t.Fatal("expected supervisor.New to fail on empty directory, got nil")
 	}
@@ -127,7 +135,7 @@ func TestDiscovery_RecursiveScanShardsProjectorsCorruptFiles(t *testing.T) {
 		t.Fatalf("writing truncated gguf: %v", err)
 	}
 
-	srv := newTestServer(t, tmpDir)
+	srv, _ := newTestServer(t, tmpDir)
 
 	// --- Assert Ollama surface: GET /api/tags ---
 	respTags, err := http.Get(srv.URL + "/api/tags")
@@ -256,7 +264,7 @@ func TestDiscovery_MultipleDirectories(t *testing.T) {
 	writeTestGGUF(t, dir1, "modelA.q4_k_m.gguf", "llama", "Q4_K_M")
 	writeTestGGUF(t, dir2, "modelB.q8_0.gguf", "mistral", "Q8_0")
 
-	srv := newTestServer(t, dir1, dir2)
+	srv, _ := newTestServer(t, dir1, dir2)
 
 	resp, err := http.Get(srv.URL + "/api/tags")
 	if err != nil {
@@ -279,5 +287,157 @@ func TestDiscovery_MultipleDirectories(t *testing.T) {
 	}
 	if tags.Models[0].Name != "modela:q4_k_m" || tags.Models[1].Name != "modelb:q8_0" {
 		t.Errorf("got models %v, want ['modela:q4_k_m', 'modelb:q8_0']", tags.Models)
+	}
+}
+
+func TestV1ChatCompletions_StreamsTokensAndAssertsArgv(t *testing.T) {
+	tmpDir := t.TempDir()
+	modelPath := writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+	srv, fakeHost := newTestServer(t, tmpDir)
+
+	body := `{"model":"llama-3-8b:q4_k_m","messages":[{"role":"user","content":"Hello"}],"stream":true}`
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want starting with text/event-stream", ct)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var lines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 SSE lines, got %d: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], `"content":"Hello"`) {
+		t.Errorf("line 0 = %q, want containing 'Hello'", lines[0])
+	}
+	if !strings.Contains(lines[3], `[DONE]`) {
+		t.Errorf("line 3 = %q, want containing '[DONE]'", lines[3])
+	}
+
+	launches := fakeHost.Launches()
+	if len(launches) != 1 {
+		t.Fatalf("expected 1 Host launch, got %d", len(launches))
+	}
+	wantArgv := []string{"llama-server", "-m", modelPath, "-c", "4096", "-np", "1"}
+	gotArgv := launches[0]
+	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
+		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+func TestV1ChatCompletions_UnknownModelReturnsOpenAINotFoundError(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	body := `{"model":"non-existent-model:tag","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decoding error response: %v", err)
+	}
+
+	if errResp.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type = %q, want %q", errResp.Error.Type, "invalid_request_error")
+	}
+	if errResp.Error.Param != "model" {
+		t.Errorf("error.param = %q, want %q", errResp.Error.Param, "model")
+	}
+	if errResp.Error.Code != "model_not_found" {
+		t.Errorf("error.code = %q, want %q", errResp.Error.Code, "model_not_found")
+	}
+	if !strings.Contains(errResp.Error.Message, "non-existent-model:tag") {
+		t.Errorf("error.message = %q, want containing model name", errResp.Error.Message)
+	}
+}
+
+func TestV1ChatCompletions_RequestCancellationPropagatesToInstance(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+	fakeHost := host.NewFakeHost()
+
+	cancelledCh := make(chan struct{}, 1)
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			_, _ = w.Write([]byte("data: chunk1\n\n"))
+			flusher.Flush()
+
+			<-r.Context().Done()
+			select {
+			case cancelledCh <- struct{}{}:
+			default:
+			}
+		}), nil
+	})
+
+	s, err := supervisor.New(fakeHost, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New failed: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"llama-3-8b:q4_k_m"}`))
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("doing request: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	n, _ := resp.Body.Read(buf)
+	if !strings.Contains(string(buf[:n]), "chunk1") {
+		t.Errorf("read chunk = %q, want containing chunk1", string(buf[:n]))
+	}
+
+	cancel()
+	_ = resp.Body.Close()
+
+	select {
+	case <-cancelledCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for instance context cancellation")
 	}
 }
