@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/TanKaizokuO/llm-server/internal/httpserve"
 	"github.com/TanKaizokuO/llm-server/internal/supervisor"
 )
 
@@ -23,23 +24,31 @@ func main() {
 	addr := flag.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
 	flag.Parse()
 
-	if err := run(*addr); err != nil {
-		fmt.Fprintln(os.Stderr, "llm-server:", err)
+	if err := run(context.Background(), *addr); err != nil {
+		slog.Error("supervisor failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(addr string) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+func run(parentCtx context.Context, addr string) error {
+	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := supervisor.Listen(addr, supervisor.New().Handler())
+	srv, err := httpserve.Listen(addr, supervisor.New().Handler())
 	if err != nil {
-		return err
+		return fmt.Errorf("initialising server: %w", err)
 	}
 
 	slog.Info("supervisor listening", "addr", srv.Addr())
 	err = srv.Serve(ctx)
-	slog.Info("supervisor stopped")
-	return err
+
+	// Unregister signal notify immediately after Serve finishes so a second
+	// signal won't be swallowed if callers use run in a process wrapper.
+	stop()
+
+	if err != nil {
+		return fmt.Errorf("serving: %w", err)
+	}
+	slog.Info("supervisor stopped gracefully")
+	return nil
 }

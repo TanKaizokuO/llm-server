@@ -26,10 +26,10 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Build
+      - name: Build static binary
+        env:
+          CGO_ENABLED: '0'
         run: go build ./...
 
-      # The default test run deliberately excludes the build-tagged suite that
-      # exercises the real Host against a GPU and a real llama-server binary.
       - name: Test
         run: go test -race ./...
