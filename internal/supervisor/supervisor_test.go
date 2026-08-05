@@ -6,6 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/TanKaizokuO/llm-server/internal/gguf"
+	"github.com/TanKaizokuO/llm-server/internal/host"
+	"github.com/TanKaizokuO/llm-server/internal/supervisor"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,10 +18,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/TanKaizokuO/llm-server/internal/gguf"
-	"github.com/TanKaizokuO/llm-server/internal/host"
-	"github.com/TanKaizokuO/llm-server/internal/supervisor"
 )
 
 func writeTestGGUF(t *testing.T, dir, filename, arch, quant string, extraKV ...map[string]any) string {
@@ -1671,5 +1671,120 @@ func TestSlots_CancellingRequestFreesSlotPromptly(t *testing.T) {
 	active, max, ok = sup.InstanceOccupancy("model-a:q4_k_m")
 	if !ok || active != 0 || max != 1 {
 		t.Fatalf("expected final occupancy 0/1, got %d/%d (ok=%v)", active, max, ok)
+	}
+}
+func TestSupervisor_V1Completions(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+	defer srv.Close()
+
+	// 1. Success case: valid model
+	body := `{"model":"llama-3-8b:q4_k_m","prompt":"Once upon a time"}`
+	resp, err := http.Post(srv.URL+"/v1/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
+	if !strings.Contains(string(respBytes), "text_completion") {
+		t.Errorf("response %q does not contain text_completion", string(respBytes))
+	}
+
+	// Verify instance is resident in FakeHost
+	if len(fakeHost.Instances()) != 1 {
+		t.Errorf("len(fakeHost.Instances()) = %d, want 1", len(fakeHost.Instances()))
+	}
+
+	// 2. Unknown model: 404 OpenAI error
+	unknownBody := `{"model":"unknown-model:q4_k_m","prompt":"Hi"}`
+	resp404, err := http.Post(srv.URL+"/v1/completions", "application/json", strings.NewReader(unknownBody))
+	if err != nil {
+		t.Fatalf("POST /v1/completions 404: %v", err)
+	}
+	defer resp404.Body.Close()
+
+	if resp404.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp404.StatusCode)
+	}
+	var errRes struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp404.Body).Decode(&errRes); err != nil {
+		t.Fatalf("decoding error response: %v", err)
+	}
+	if errRes.Error.Code != "model_not_found" {
+		t.Errorf("error code = %q, want model_not_found", errRes.Error.Code)
+	}
+}
+
+func TestSupervisor_V1Embeddings(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+	defer srv.Close()
+
+	// 1. Success case: valid model
+	body := `{"model":"llama-3-8b:q4_k_m","input":"Hello world"}`
+	resp, err := http.Post(srv.URL+"/v1/embeddings", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/embeddings: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
+	if !strings.Contains(string(respBytes), "embedding") {
+		t.Errorf("response %q does not contain embedding", string(respBytes))
+	}
+
+	// Verify instance is resident in FakeHost
+	if len(fakeHost.Instances()) != 1 {
+		t.Errorf("len(fakeHost.Instances()) = %d, want 1", len(fakeHost.Instances()))
+	}
+
+	// 2. Unknown model: 404 OpenAI error
+	unknownBody := `{"model":"unknown-model:q4_k_m","input":"Hi"}`
+	resp404, err := http.Post(srv.URL+"/v1/embeddings", "application/json", strings.NewReader(unknownBody))
+	if err != nil {
+		t.Fatalf("POST /v1/embeddings 404: %v", err)
+	}
+	defer resp404.Body.Close()
+
+	if resp404.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp404.StatusCode)
+	}
+	var errRes struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp404.Body).Decode(&errRes); err != nil {
+		t.Fatalf("decoding error response: %v", err)
+	}
+	if errRes.Error.Code != "model_not_found" {
+		t.Errorf("error code = %q, want model_not_found", errRes.Error.Code)
 	}
 }

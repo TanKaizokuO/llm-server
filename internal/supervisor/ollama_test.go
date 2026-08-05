@@ -657,3 +657,81 @@ func TestOllama_APIPs(t *testing.T) {
 		t.Errorf("model.max_slots = %d, want >= 1", m.MaxSlots)
 	}
 }
+func TestOllama_APIEmbed(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, fakeHost := newTestServer(t, tmpDir)
+	defer srv.Close()
+
+	// 1. Success POST /api/embed
+	body := `{"model":"llama-3-8b:q4_k_m","input":"Hello world"}`
+	resp, err := http.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/embed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var resEmbed struct {
+		Model      string      `json:"model"`
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resEmbed); err != nil {
+		t.Fatalf("decoding /api/embed response: %v", err)
+	}
+	if len(resEmbed.Embeddings) != 1 || len(resEmbed.Embeddings[0]) != 3 {
+		t.Errorf("got embeddings = %v, want 1 vector of length 3", resEmbed.Embeddings)
+	}
+	if resEmbed.Model != "llama-3-8b:q4_k_m" {
+		t.Errorf("got model = %q, want llama-3-8b:q4_k_m", resEmbed.Model)
+	}
+
+	// Verify instance is resident in FakeHost
+	if len(fakeHost.Instances()) != 1 {
+		t.Errorf("len(fakeHost.Instances()) = %d, want 1", len(fakeHost.Instances()))
+	}
+
+	// 2. Success POST /api/embeddings (legacy endpoint)
+	bodyLegacy := `{"model":"llama-3-8b:q4_k_m","prompt":"Hello world"}`
+	respLegacy, err := http.Post(srv.URL+"/api/embeddings", "application/json", strings.NewReader(bodyLegacy))
+	if err != nil {
+		t.Fatalf("POST /api/embeddings: %v", err)
+	}
+	defer respLegacy.Body.Close()
+
+	if respLegacy.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", respLegacy.StatusCode)
+	}
+	var resLegacy struct {
+		Embedding []float64 `json:"embedding"`
+	}
+	if err := json.NewDecoder(respLegacy.Body).Decode(&resLegacy); err != nil {
+		t.Fatalf("decoding /api/embeddings response: %v", err)
+	}
+	if len(resLegacy.Embedding) != 3 {
+		t.Errorf("got embedding = %v, want vector of length 3", resLegacy.Embedding)
+	}
+	// 3. Unknown model: 404 Ollama error format
+	unknownBody := `{"model":"unknown-model:q4_k_m","input":"Hi"}`
+	resp404, err := http.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(unknownBody))
+	if err != nil {
+		t.Fatalf("POST /api/embed 404: %v", err)
+	}
+	defer resp404.Body.Close()
+
+	if resp404.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp404.StatusCode)
+	}
+	var errRes struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp404.Body).Decode(&errRes); err != nil {
+		t.Fatalf("decoding error response: %v", err)
+	}
+	if errRes.Error != "model 'unknown-model:q4_k_m' not found" {
+		t.Errorf("error string = %q, want model 'unknown-model:q4_k_m' not found", errRes.Error)
+	}
+}

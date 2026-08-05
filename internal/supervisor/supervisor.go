@@ -518,11 +518,15 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tags", s.handleAPITags)
 	mux.HandleFunc("POST /api/chat", s.handleAPIChat)
 	mux.HandleFunc("POST /api/generate", s.handleAPIGenerate)
+	mux.HandleFunc("POST /api/embed", s.handleAPIEmbed)
+	mux.HandleFunc("POST /api/embeddings", s.handleAPIEmbed)
 	mux.HandleFunc("GET /api/version", s.handleAPIVersion)
 	mux.HandleFunc("POST /api/show", s.handleAPIShow)
 	mux.HandleFunc("GET /api/ps", s.handleAPIPs)
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
+	mux.HandleFunc("POST /v1/chat/completions", s.handleV1OpenAIProxy)
+	mux.HandleFunc("POST /v1/completions", s.handleV1OpenAIProxy)
+	mux.HandleFunc("POST /v1/embeddings", s.handleV1OpenAIProxy)
 	mux.HandleFunc("GET /v1/tuning", s.handleV1TuningGet)
 	mux.HandleFunc("POST /v1/tuning/reset", s.handleV1TuningReset)
 	mux.HandleFunc("DELETE /v1/tuning", s.handleV1TuningReset)
@@ -728,7 +732,7 @@ func (s *Supervisor) handleV1Models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-type openAIChatCompletionRequest struct {
+type openAIRequest struct {
 	Model string `json:"model"`
 }
 
@@ -816,7 +820,7 @@ func (s *Supervisor) resolveModel(ref string) (Model, error) {
 	return m, nil
 }
 
-func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (s *Supervisor) handleV1OpenAIProxy(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "", "invalid_request")
@@ -824,12 +828,11 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-	var req openAIChatCompletionRequest
+	var req openAIRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil || req.Model == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid request body", "model", "invalid_request")
 		return
 	}
-
 	model, err := s.resolveModel(req.Model)
 	if err != nil {
 		var notFound *ModelNotFoundError
@@ -877,6 +880,7 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 	proxy.ServeHTTP(w, r)
 }
+
 func (s *Supervisor) resolveTTLLocked(modelID string) time.Duration {
 	if ttl, ok := s.modelTTLs[modelID]; ok {
 		return ttl

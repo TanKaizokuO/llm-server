@@ -58,6 +58,12 @@ type ollamaShowResponse struct {
 	Details    ollamaModelDetails `json:"details"`
 	ModelInfo  map[string]any     `json:"model_info"`
 }
+type ollamaEmbedRequest struct {
+	Model     string          `json:"model"`
+	Input     any             `json:"input"`
+	Prompt    any             `json:"prompt"`
+	KeepAlive json.RawMessage `json:"keep_alive"`
+}
 
 type ollamaPSModel struct {
 	Name          string             `json:"name"`
@@ -182,6 +188,145 @@ func (s *Supervisor) handleAPIPs(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, ollamaPSResponse{Models: models})
+}
+
+type openAIEmbeddingData struct {
+	Embedding []float64 `json:"embedding"`
+	Index     int       `json:"index"`
+}
+
+type openAIEmbeddingsResponse struct {
+	Data []openAIEmbeddingData `json:"data"`
+}
+
+func (s *Supervisor) handleAPIEmbed(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOllamaError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req ollamaEmbedRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil || req.Model == "" {
+		writeOllamaError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	model, err := s.resolveModel(req.Model)
+	if err != nil {
+		var notFound *ModelNotFoundError
+		var ambiguous *AmbiguousModelError
+		switch {
+		case errors.As(err, &notFound):
+			writeOllamaError(w, http.StatusNotFound, fmt.Sprintf("model '%s' not found", notFound.Ref))
+		case errors.As(err, &ambiguous):
+			msg := fmt.Sprintf("model '%s' is ambiguous; available tags: %s", ambiguous.Name, strings.Join(ambiguous.Tags, ", "))
+			writeOllamaError(w, http.StatusBadRequest, msg)
+		default:
+			writeOllamaError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	ttl, keepAliveSet := parseKeepAlive(req.KeepAlive)
+	if keepAliveSet && ttl != 0 {
+		_ = s.SetModelTTL(model.ID, ttl)
+	}
+
+	inst, release, err := s.getOrLaunchInstance(r.Context(), model)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		status := http.StatusInternalServerError
+		if err.Error() == "supervisor is closed" {
+			status = http.StatusServiceUnavailable
+		}
+		writeOllamaError(w, status, err.Error())
+		return
+	}
+
+	if keepAliveSet && ttl == 0 {
+		s.mu.Lock()
+		resInst := s.instances[model.ID]
+		s.mu.Unlock()
+		if resInst != nil {
+			defer func() {
+				release()
+				go resInst.drainAndStop(s, "keep_alive=0")
+			}()
+		} else {
+			defer release()
+		}
+	} else {
+		defer release()
+	}
+
+	input := req.Input
+	if input == nil {
+		input = req.Prompt
+	}
+
+	openAIReqBody, err := json.Marshal(map[string]any{
+		"model": model.ID,
+		"input": input,
+	})
+	if err != nil {
+		writeOllamaError(w, http.StatusInternalServerError, "failed to serialize request")
+		return
+	}
+
+	childURL := inst.URL().String() + "/v1/embeddings"
+	childReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, childURL, bytes.NewReader(openAIReqBody))
+	if err != nil {
+		writeOllamaError(w, http.StatusInternalServerError, "failed to create child request")
+		return
+	}
+	childReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(childReq)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		writeOllamaError(w, http.StatusServiceUnavailable, fmt.Sprintf("proxy error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		writeOllamaError(w, resp.StatusCode, string(respBody))
+		return
+	}
+
+	var openAIResp openAIEmbeddingsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&openAIResp); err != nil {
+		writeOllamaError(w, http.StatusInternalServerError, "failed to decode child response")
+		return
+	}
+
+	if r.URL.Path == "/api/embeddings" {
+		var emb []float64
+		if len(openAIResp.Data) > 0 {
+			emb = openAIResp.Data[0].Embedding
+		} else {
+			emb = []float64{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"embedding": emb,
+		})
+		return
+	}
+
+	embeddings := make([][]float64, len(openAIResp.Data))
+	for i, d := range openAIResp.Data {
+		embeddings[i] = d.Embedding
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"model":      req.Model,
+		"embeddings": embeddings,
+	})
 }
 
 type ollamaChatIntermediateChunk struct {

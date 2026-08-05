@@ -220,6 +220,14 @@ func DefaultMockHandler(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(5 * time.Millisecond)
 			}
 		}
+	case "/v1/completions":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"cmpl-fake","object":"text_completion","created":1700000000,"model":"fake","choices":[{"text":"Hello world!","index":0,"finish_reason":"stop"}]}`))
+	case "/v1/embeddings":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"model":"fake","usage":{"prompt_tokens":2,"total_tokens":2}}`))
 	default:
 		http.NotFound(w, r)
 	}
