@@ -552,8 +552,6 @@ func TestModelResolution_BareNameReturnsErrorWhenAmbiguous(t *testing.T) {
 	}
 }
 
-
-
 func TestRegistry_LoadCoalescence(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")

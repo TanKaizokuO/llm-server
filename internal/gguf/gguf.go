@@ -354,7 +354,6 @@ func extractMetadata(kv map[string]any) Metadata {
 		}
 	}
 
-
 	// 3. Quantization
 	if val, ok := kv["general.file_type"]; ok {
 		if code, ok := toUint64(val); ok {

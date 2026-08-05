@@ -15,8 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,29 +44,65 @@ func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration
 	return inst.Stop(stopCtx)
 }
 
-// Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
-// and, in later work, the Instance registry and the Tuning cache.
+// TuningEntry represents a cached, empirically measured tuning configuration for a Model.
+type TuningEntry struct {
+	ModelID      string          `json:"model_id"`
+	ModelDigest  string          `json:"model_digest"`
+	Fingerprint  string          `json:"fingerprint"`
+	RequestedCtx uint64          `json:"requested_ctx"`
+	KVCacheType  string          `json:"kv_cache_type"`
+	Offload      uint64          `json:"offload"`
+	ResultingCtx uint64          `json:"resulting_ctx"`
+	Allocation   host.Allocation `json:"allocation"`
+	MeasuredAt   time.Time       `json:"measured_at"`
+}
+
+// TuningCacheFile represents the root JSON structure persisted on disk.
+type TuningCacheFile struct {
+	Fingerprint string                 `json:"fingerprint"`
+	Entries     map[string]TuningEntry `json:"entries"`
+}
+
 type tunedConfig struct {
 	CtxLen  uint64
 	Offload uint64
 }
 
+// Option configures optional parameters on a Supervisor.
+type Option func(*Supervisor)
+
+// WithCachePath sets the file path for persisting tuning results.
+func WithCachePath(path string) Option {
+	return func(s *Supervisor) {
+		s.cachePath = path
+	}
+}
+
+// Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
+// the Instance registry, and the Tuning cache.
 type Supervisor struct {
-	mu         sync.RWMutex
-	host       host.Host
-	models     map[string]Model
-	modelsList []Model
-	instances  map[string]host.Instance
-	loading    map[string]*pendingInstance
-	tuned      map[string]tunedConfig
-	tuningMu   sync.Mutex
-	closed     bool
+	mu                sync.RWMutex
+	host              host.Host
+	models            map[string]Model
+	modelsList        []Model
+	instances         map[string]host.Instance
+	loading           map[string]*pendingInstance
+	tuned             map[string]TuningEntry
+	tuningMu          sync.Mutex
+	tuningActiveModel string
+	cachePath         string
+	closed            bool
 }
 
 // New builds a Supervisor by scanning the configured directories for Models.
 // Host is the single injected boundary in the system representing physical hardware.
 // If h is nil, a default real Host is used.
 func New(h host.Host, dirs ...string) (*Supervisor, error) {
+	return NewWithOpts(h, dirs)
+}
+
+// NewWithOpts builds a Supervisor with optional configuration options.
+func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error) {
 	if h == nil {
 		h = host.New()
 	}
@@ -80,14 +119,90 @@ func New(h host.Host, dirs ...string) (*Supervisor, error) {
 		modelMap[m.ID] = m
 	}
 
-	return &Supervisor{
+	defaultCachePath := "tuning.json"
+	if len(dirs) > 0 && dirs[0] != "" {
+		defaultCachePath = filepath.Join(dirs[0], "tuning.json")
+	}
+
+	s := &Supervisor{
 		host:       h,
 		models:     modelMap,
 		modelsList: models,
 		instances:  make(map[string]host.Instance),
 		loading:    make(map[string]*pendingInstance),
-		tuned:      make(map[string]tunedConfig),
-	}, nil
+		tuned:      make(map[string]TuningEntry),
+		cachePath:  defaultCachePath,
+	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	s.loadTuningCache()
+
+	return s, nil
+}
+
+func (s *Supervisor) loadTuningCache() {
+	if s.cachePath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.cachePath)
+	if err != nil {
+		return
+	}
+
+	var cacheFile TuningCacheFile
+	if err := json.Unmarshal(data, &cacheFile); err != nil {
+		slog.Warn("failed to parse tuning cache file, resetting", "path", s.cachePath, "err", err)
+		_ = os.Remove(s.cachePath)
+		return
+	}
+
+	fp := s.host.Fingerprint()
+	if cacheFile.Fingerprint != fp {
+		slog.Info("hardware fingerprint changed, invalidating tuning cache", "old", cacheFile.Fingerprint, "new", fp)
+		_ = os.Remove(s.cachePath)
+		return
+	}
+
+	for id, entry := range cacheFile.Entries {
+		if entry.Fingerprint == fp {
+			s.tuned[id] = entry
+		}
+	}
+}
+
+func (s *Supervisor) saveTuningCacheLocked() {
+	if s.cachePath == "" {
+		return
+	}
+	cacheFile := TuningCacheFile{
+		Fingerprint: s.host.Fingerprint(),
+		Entries:     s.tuned,
+	}
+	data, err := json.MarshalIndent(cacheFile, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal tuning cache", "err", err)
+		return
+	}
+
+	dir := filepath.Dir(s.cachePath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			slog.Error("failed to create directory for tuning cache", "dir", dir, "err", err)
+			return
+		}
+	}
+
+	tmpPath := s.cachePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		slog.Error("failed to write tuning cache temp file", "tmpPath", tmpPath, "err", err)
+		return
+	}
+	if err := os.Rename(tmpPath, s.cachePath); err != nil {
+		slog.Error("failed to rename tuning cache file", "err", err)
+	}
 }
 
 // Handler returns the Supervisor's HTTP router. This is the single router the
@@ -98,6 +213,12 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tags", s.handleAPITags)
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
+	mux.HandleFunc("GET /v1/tuning", s.handleV1TuningGet)
+	mux.HandleFunc("POST /v1/tuning/reset", s.handleV1TuningReset)
+	mux.HandleFunc("DELETE /v1/tuning", s.handleV1TuningReset)
+	mux.HandleFunc("GET /api/tuning", s.handleV1TuningGet)
+	mux.HandleFunc("POST /api/tuning/reset", s.handleV1TuningReset)
+	mux.HandleFunc("DELETE /api/tuning", s.handleV1TuningReset)
 	return mux
 }
 
@@ -337,29 +458,41 @@ func (s *Supervisor) resolveModel(ref string) (Model, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if m, ok := s.models[ref]; ok {
-		return m, nil
-	}
+	var m Model
+	if exact, ok := s.models[ref]; ok {
+		m = exact
+	} else {
+		var matches []Model
+		for _, candidate := range s.modelsList {
+			if candidate.ID == ref || candidate.Name == ref {
+				matches = append(matches, candidate)
+			}
+		}
 
-	var matches []Model
-	for _, m := range s.modelsList {
-		if m.Name == ref {
-			matches = append(matches, m)
+		if len(matches) == 0 {
+			return Model{}, &ModelNotFoundError{Ref: ref}
+		}
+
+		if len(matches) == 1 {
+			m = matches[0]
+		} else {
+			tags := make([]string, len(matches))
+			for i, cand := range matches {
+				tags[i] = cand.Tag
+			}
+			return Model{}, &AmbiguousModelError{Name: ref, Tags: tags}
 		}
 	}
 
-	if len(matches) == 0 {
-		return Model{}, &ModelNotFoundError{Ref: ref}
-	}
-	if len(matches) == 1 {
-		return matches[0], nil
+	if info, err := os.Stat(m.Path); err == nil {
+		if info.Size() != m.Size || !info.ModTime().Equal(m.ModTime) {
+			m.Size = info.Size()
+			m.ModTime = info.ModTime()
+			m.Digest = computeDigest(m)
+		}
 	}
 
-	tags := make([]string, len(matches))
-	for i, m := range matches {
-		tags[i] = strings.ToLower(m.Quantization)
-	}
-	return Model{}, &AmbiguousModelError{Name: ref, Tags: tags}
+	return m, nil
 }
 
 func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -534,6 +667,15 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 	s.tuningMu.Lock()
 	defer s.tuningMu.Unlock()
 
+	s.mu.Lock()
+	s.tuningActiveModel = m.ID
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.tuningActiveModel = ""
+		s.mu.Unlock()
+	}()
+
 	s.evictAllResidentInstances()
 
 	ctxLen := m.ContextLength
@@ -560,8 +702,20 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 		cfg := tunedConfig{CtxLen: currentCtx, Offload: maxOffload}
 		inst, err := s.launchConfig(loadCtx, m, cfg)
 		if err == nil {
+			entry := TuningEntry{
+				ModelID:      m.ID,
+				ModelDigest:  m.Digest,
+				Fingerprint:  s.host.Fingerprint(),
+				RequestedCtx: ctxLen,
+				KVCacheType:  "f16",
+				Offload:      cfg.Offload,
+				ResultingCtx: cfg.CtxLen,
+				Allocation:   inst.ObservedAllocation(),
+				MeasuredAt:   time.Now().UTC(),
+			}
 			s.mu.Lock()
-			s.tuned[m.ID] = cfg
+			s.tuned[m.ID] = entry
+			s.saveTuningCacheLocked()
 			s.mu.Unlock()
 			return inst, nil
 		}
@@ -572,38 +726,49 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 
 		low := 0
 		high := int(maxOffload) - 1
-		var bestInst host.Instance
 		var bestCfg tunedConfig
+		var found bool
 
 		for low <= high {
 			mid := low + (high-low)/2
 			cfg = tunedConfig{CtxLen: currentCtx, Offload: uint64(mid)}
-			inst, err = s.launchConfig(loadCtx, m, cfg)
+			probeInst, err := s.launchConfig(loadCtx, m, cfg)
 
 			if err == nil {
-				if bestInst != nil {
-					_ = stopInstance(context.Background(), bestInst, 5*time.Second)
-				}
-				bestInst = inst
 				bestCfg = cfg
+				found = true
+				_ = stopInstance(context.Background(), probeInst, 5*time.Second)
 				low = mid + 1
 			} else {
 				lastErr = err
 				if !host.IsOOM(err) {
-					if bestInst != nil {
-						_ = stopInstance(context.Background(), bestInst, 5*time.Second)
-					}
 					return nil, fmt.Errorf("tuning aborted due to non-memory error: %w", err)
 				}
 				high = mid - 1
 			}
 		}
 
-		if bestInst != nil {
+		if found {
+			finalInst, err := s.launchConfig(loadCtx, m, bestCfg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to launch best tuned configuration: %w", err)
+			}
+			entry := TuningEntry{
+				ModelID:      m.ID,
+				ModelDigest:  m.Digest,
+				Fingerprint:  s.host.Fingerprint(),
+				RequestedCtx: ctxLen,
+				KVCacheType:  "f16",
+				Offload:      bestCfg.Offload,
+				ResultingCtx: bestCfg.CtxLen,
+				Allocation:   finalInst.ObservedAllocation(),
+				MeasuredAt:   time.Now().UTC(),
+			}
 			s.mu.Lock()
-			s.tuned[m.ID] = bestCfg
+			s.tuned[m.ID] = entry
+			s.saveTuningCacheLocked()
 			s.mu.Unlock()
-			return bestInst, nil
+			return finalInst, nil
 		}
 	}
 
@@ -612,14 +777,112 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 
 func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
 	s.mu.RLock()
-	cfg, ok := s.tuned[m.ID]
+	entry, ok := s.tuned[m.ID]
 	s.mu.RUnlock()
 
-	if !ok {
-		return s.tune(loadCtx, m)
+	reqCtx := m.ContextLength
+	if reqCtx == 0 {
+		reqCtx = 2048
 	}
 
-	return s.launchConfig(loadCtx, m, cfg)
+	fp := s.host.Fingerprint()
+
+	if ok {
+		if entry.Fingerprint == fp &&
+			entry.ModelDigest == m.Digest &&
+			entry.RequestedCtx == reqCtx &&
+			entry.KVCacheType == "f16" {
+			cfg := tunedConfig{CtxLen: entry.ResultingCtx, Offload: entry.Offload}
+			return s.launchConfig(loadCtx, m, cfg)
+		}
+		s.mu.Lock()
+		delete(s.tuned, m.ID)
+		s.saveTuningCacheLocked()
+		s.mu.Unlock()
+	}
+
+	return s.tune(loadCtx, m)
+}
+
+type tuningResponse struct {
+	Status      string                 `json:"status"`
+	ActiveModel string                 `json:"active_model,omitempty"`
+	Fingerprint string                 `json:"fingerprint"`
+	Entries     map[string]TuningEntry `json:"entries"`
+}
+
+func (s *Supervisor) handleV1TuningGet(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status := "idle"
+	if s.tuningActiveModel != "" {
+		status = "tuning"
+	}
+
+	resp := tuningResponse{
+		Status:      status,
+		ActiveModel: s.tuningActiveModel,
+		Fingerprint: s.host.Fingerprint(),
+		Entries:     make(map[string]TuningEntry, len(s.tuned)),
+	}
+	for id, entry := range s.tuned {
+		resp.Entries[id] = entry
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type tuningResetRequest struct {
+	Model string `json:"model"`
+}
+
+func (s *Supervisor) handleV1TuningReset(w http.ResponseWriter, r *http.Request) {
+	ref := r.URL.Query().Get("model")
+	if ref == "" {
+		ref = r.URL.Query().Get("ref")
+	}
+
+	if ref == "" && r.Body != nil && r.ContentLength > 0 {
+		var req tuningResetRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		ref = req.Model
+	}
+
+	if ref != "" {
+		m, err := s.resolveModel(ref)
+		targetID := ref
+		if err == nil {
+			targetID = m.ID
+		}
+
+		_ = s.Evict(r.Context(), targetID)
+
+		s.mu.Lock()
+		delete(s.tuned, targetID)
+		s.saveTuningCacheLocked()
+		s.mu.Unlock()
+
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "ok",
+			"message": fmt.Sprintf("tuning cache entry reset for model %s", targetID),
+		})
+		return
+	}
+
+	s.evictAllResidentInstances()
+
+	s.mu.Lock()
+	s.tuned = make(map[string]TuningEntry)
+	if s.cachePath != "" {
+		_ = os.Remove(s.cachePath)
+	}
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "all tuning cache entries reset",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

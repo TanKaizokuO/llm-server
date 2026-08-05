@@ -40,6 +40,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	addr := fs.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
+	cachePath := fs.String("tuning-cache", "tuning.json", "path to the tuning cache JSON file")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -47,7 +48,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr, fs.Args()...)
+	return runServer(parentCtx, *addr, *cachePath, fs.Args()...)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -88,12 +89,12 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr string, dirs ...string) error {
+func runServer(parentCtx context.Context, addr string, cachePath string, dirs ...string) error {
 	if len(dirs) == 0 {
 		dirs = []string{"."}
 	}
 	h := host.New()
-	sup, err := supervisor.New(h, dirs...)
+	sup, err := supervisor.NewWithOpts(h, dirs, supervisor.WithCachePath(cachePath))
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)
 	}

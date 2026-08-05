@@ -129,6 +129,7 @@ func (f *FakeHost) Instances() []Instance {
 	copy(cp, f.instances)
 	return cp
 }
+
 // LastLaunch returns a deep copy of the most recent argv passed to Launch, or nil if none.
 func (f *FakeHost) LastLaunch() []string {
 	f.mu.Lock()
