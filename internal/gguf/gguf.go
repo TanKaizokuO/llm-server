@@ -102,6 +102,7 @@ func FileTypeNameToType(name string) (uint32, bool) {
 type Metadata struct {
 	Architecture  string `json:"architecture"`
 	ContextLength uint64 `json:"context_length"`
+	BlockCount    uint64 `json:"block_count"`
 	Quantization  string `json:"quantization"`
 }
 
@@ -339,6 +340,20 @@ func extractMetadata(kv map[string]any) Metadata {
 			}
 		}
 	}
+	// 2.5 Block Count
+	blockKeys := []string{
+		meta.Architecture + ".block_count",
+		"llm.block_count",
+	}
+	for _, k := range blockKeys {
+		if val, ok := kv[k]; ok {
+			if num, ok := toUint64(val); ok {
+				meta.BlockCount = num
+				break
+			}
+		}
+	}
+
 
 	// 3. Quantization
 	if val, ok := kv["general.file_type"]; ok {

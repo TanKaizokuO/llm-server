@@ -43,6 +43,11 @@ func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration
 
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // and, in later work, the Instance registry and the Tuning cache.
+type tunedConfig struct {
+	CtxLen  uint64
+	Offload uint64
+}
+
 type Supervisor struct {
 	mu         sync.RWMutex
 	host       host.Host
@@ -50,6 +55,8 @@ type Supervisor struct {
 	modelsList []Model
 	instances  map[string]host.Instance
 	loading    map[string]*pendingInstance
+	tuned      map[string]tunedConfig
+	tuningMu   sync.Mutex
 	closed     bool
 }
 
@@ -79,6 +86,7 @@ func New(h host.Host, dirs ...string) (*Supervisor, error) {
 		modelsList: models,
 		instances:  make(map[string]host.Instance),
 		loading:    make(map[string]*pendingInstance),
+		tuned:      make(map[string]tunedConfig),
 	}, nil
 }
 
@@ -483,15 +491,26 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 	return req.inst, nil
 }
 
-func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
-	ctxLen := m.ContextLength
-	if ctxLen == 0 {
-		ctxLen = 2048
+func (s *Supervisor) evictAllResidentInstances() {
+	s.mu.Lock()
+	var toStop []host.Instance
+	for id, inst := range s.instances {
+		toStop = append(toStop, inst)
+		delete(s.instances, id)
 	}
+	s.mu.Unlock()
+
+	for _, inst := range toStop {
+		_ = stopInstance(context.Background(), inst, 5*time.Second)
+	}
+}
+
+func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunedConfig) (host.Instance, error) {
 	argv := []string{
 		"llama-server",
 		"-m", m.Path,
-		"-c", strconv.FormatUint(ctxLen, 10),
+		"-c", strconv.FormatUint(cfg.CtxLen, 10),
+		"-ngl", strconv.FormatUint(cfg.Offload, 10),
 		"-np", "1",
 	}
 
@@ -509,6 +528,98 @@ func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Inst
 	}
 
 	return newInst, nil
+}
+
+func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, error) {
+	s.tuningMu.Lock()
+	defer s.tuningMu.Unlock()
+
+	s.evictAllResidentInstances()
+
+	ctxLen := m.ContextLength
+	if ctxLen == 0 {
+		ctxLen = 2048
+	}
+	var ladder []uint64
+	for _, step := range []uint64{ctxLen, 32768, 16384, 8192, 4096, 2048, 1024, 512} {
+		if step <= ctxLen {
+			if len(ladder) == 0 || ladder[len(ladder)-1] != step {
+				ladder = append(ladder, step)
+			}
+		}
+	}
+
+	maxOffload := m.BlockCount
+	if maxOffload == 0 {
+		maxOffload = 100 // fallback
+	}
+
+	var lastErr error
+
+	for _, currentCtx := range ladder {
+		cfg := tunedConfig{CtxLen: currentCtx, Offload: maxOffload}
+		inst, err := s.launchConfig(loadCtx, m, cfg)
+		if err == nil {
+			s.mu.Lock()
+			s.tuned[m.ID] = cfg
+			s.mu.Unlock()
+			return inst, nil
+		}
+		lastErr = err
+		if !host.IsOOM(err) {
+			return nil, fmt.Errorf("tuning aborted due to non-memory error: %w", err)
+		}
+
+		low := 0
+		high := int(maxOffload) - 1
+		var bestInst host.Instance
+		var bestCfg tunedConfig
+
+		for low <= high {
+			mid := low + (high-low)/2
+			cfg = tunedConfig{CtxLen: currentCtx, Offload: uint64(mid)}
+			inst, err = s.launchConfig(loadCtx, m, cfg)
+
+			if err == nil {
+				if bestInst != nil {
+					_ = stopInstance(context.Background(), bestInst, 5*time.Second)
+				}
+				bestInst = inst
+				bestCfg = cfg
+				low = mid + 1
+			} else {
+				lastErr = err
+				if !host.IsOOM(err) {
+					if bestInst != nil {
+						_ = stopInstance(context.Background(), bestInst, 5*time.Second)
+					}
+					return nil, fmt.Errorf("tuning aborted due to non-memory error: %w", err)
+				}
+				high = mid - 1
+			}
+		}
+
+		if bestInst != nil {
+			s.mu.Lock()
+			s.tuned[m.ID] = bestCfg
+			s.mu.Unlock()
+			return bestInst, nil
+		}
+	}
+
+	return nil, fmt.Errorf("model is unservable: exceeds available memory even at minimum configuration (last error: %v)", lastErr)
+}
+
+func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
+	s.mu.RLock()
+	cfg, ok := s.tuned[m.ID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return s.tune(loadCtx, m)
+	}
+
+	return s.launchConfig(loadCtx, m, cfg)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

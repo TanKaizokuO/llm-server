@@ -340,7 +340,7 @@ func TestV1ChatCompletions_StreamsTokensAndAssertsArgv(t *testing.T) {
 	if len(launches) != 1 {
 		t.Fatalf("expected 1 Host launch, got %d", len(launches))
 	}
-	wantArgv := []string{"llama-server", "-m", modelPath, "-c", "4096", "-np", "1"}
+	wantArgv := []string{"llama-server", "-m", modelPath, "-c", "4096", "-ngl", "100", "-np", "1"}
 	gotArgv := launches[0]
 	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
 		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
@@ -466,7 +466,7 @@ func TestModelResolution_ExactNameTagResolvesWhenMultipleQuantisationsExist(t *t
 	if len(launches) != 1 {
 		t.Fatalf("expected 1 Host launch, got %d", len(launches))
 	}
-	wantArgv := []string{"llama-server", "-m", pathQ8, "-c", "4096", "-np", "1"}
+	wantArgv := []string{"llama-server", "-m", pathQ8, "-c", "4096", "-ngl", "100", "-np", "1"}
 	gotArgv := launches[0]
 	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
 		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
@@ -494,7 +494,7 @@ func TestModelResolution_BareNameResolvesWhenUnambiguous(t *testing.T) {
 	if len(launches) != 1 {
 		t.Fatalf("expected 1 Host launch, got %d", len(launches))
 	}
-	wantArgv := []string{"llama-server", "-m", pathQ4, "-c", "4096", "-np", "1"}
+	wantArgv := []string{"llama-server", "-m", pathQ4, "-c", "4096", "-ngl", "100", "-np", "1"}
 	gotArgv := launches[0]
 	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
 		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)

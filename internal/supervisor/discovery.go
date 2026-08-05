@@ -28,6 +28,7 @@ type Model struct {
 	Digest        string    `json:"digest"`         // Pre-computed sha256 digest
 	Architecture  string    `json:"architecture"`   // GGUF general.architecture
 	ContextLength uint64    `json:"context_length"` // GGUF context length
+	BlockCount    uint64    `json:"block_count"`    // GGUF block count (layers)
 	Quantization  string    `json:"quantization"`   // Raw GGUF quantization string (e.g. "Q4_K_M")
 }
 
@@ -149,6 +150,7 @@ func inspectFile(path string, d fs.DirEntry) (Model, bool, error) {
 		ModTime:       info.ModTime(),
 		Architecture:  hdr.Metadata.Architecture,
 		ContextLength: hdr.Metadata.ContextLength,
+		BlockCount:    hdr.Metadata.BlockCount,
 		Quantization:  hdr.Metadata.Quantization,
 	}
 	m.Digest = computeDigest(m)
