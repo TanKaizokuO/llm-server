@@ -29,10 +29,12 @@ import (
 )
 
 type pendingInstance struct {
-	ready  chan struct{}
-	cancel context.CancelFunc
-	inst   host.Instance
-	err    error
+	mu      sync.Mutex
+	ready   chan struct{}
+	cancel  context.CancelFunc
+	callers int
+	inst    host.Instance
+	err     error
 }
 
 func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration) error {
@@ -78,20 +80,32 @@ func WithCachePath(path string) Option {
 	}
 }
 
+// WithTuningBudget sets the maximum duration allowed for a single tuning run.
+func WithTuningBudget(d time.Duration) Option {
+	return func(s *Supervisor) {
+		s.tuningBudget = d
+	}
+}
+
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // the Instance registry, and the Tuning cache.
 type Supervisor struct {
-	mu                sync.RWMutex
-	host              host.Host
-	models            map[string]Model
-	modelsList        []Model
-	instances         map[string]host.Instance
-	loading           map[string]*pendingInstance
-	tuned             map[string]TuningEntry
-	tuningMu          sync.Mutex
-	tuningActiveModel string
-	cachePath         string
-	closed            bool
+	mu                   sync.RWMutex
+	host                 host.Host
+	models               map[string]Model
+	modelsList           []Model
+	instances            map[string]host.Instance
+	loading              map[string]*pendingInstance
+	tuned                map[string]TuningEntry
+	tuningMu             sync.Mutex
+	tuningActiveModel    string
+	tuningStartedAt      time.Time
+	tuningCurrentCtx     uint64
+	tuningCurrentOffload uint64
+	tuningProbeCount     int
+	cachePath            string
+	tuningBudget         time.Duration
+	closed               bool
 }
 
 // New builds a Supervisor by scanning the configured directories for Models.
@@ -123,15 +137,17 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 	if len(dirs) > 0 && dirs[0] != "" {
 		defaultCachePath = filepath.Join(dirs[0], "tuning.json")
 	}
+	defaultBudget := 2 * time.Minute
 
 	s := &Supervisor{
-		host:       h,
-		models:     modelMap,
-		modelsList: models,
-		instances:  make(map[string]host.Instance),
-		loading:    make(map[string]*pendingInstance),
-		tuned:      make(map[string]TuningEntry),
-		cachePath:  defaultCachePath,
+		host:         h,
+		models:       modelMap,
+		modelsList:   models,
+		instances:    make(map[string]host.Instance),
+		loading:      make(map[string]*pendingInstance),
+		tuned:        make(map[string]TuningEntry),
+		cachePath:    defaultCachePath,
+		tuningBudget: defaultBudget,
 	}
 
 	for _, opt := range opts {
@@ -574,7 +590,27 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 	}
 
 	if req, ok := s.loading[m.ID]; ok {
+		req.mu.Lock()
+		req.callers++
+		req.mu.Unlock()
 		s.mu.Unlock()
+
+		doneMonitor := make(chan struct{})
+		defer close(doneMonitor)
+		go func() {
+			select {
+			case <-ctx.Done():
+				req.mu.Lock()
+				req.callers--
+				if req.callers == 0 && req.cancel != nil {
+					req.cancel()
+				}
+				req.mu.Unlock()
+			case <-req.ready:
+			case <-doneMonitor:
+			}
+		}()
+
 		select {
 		case <-req.ready:
 			if req.err != nil {
@@ -588,11 +624,28 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 
 	loadCtx, loadCancel := context.WithCancel(context.Background())
 	req := &pendingInstance{
-		ready:  make(chan struct{}),
-		cancel: loadCancel,
+		ready:   make(chan struct{}),
+		cancel:  loadCancel,
+		callers: 1,
 	}
 	s.loading[m.ID] = req
 	s.mu.Unlock()
+
+	doneMonitor := make(chan struct{})
+	defer close(doneMonitor)
+	go func() {
+		select {
+		case <-ctx.Done():
+			req.mu.Lock()
+			req.callers--
+			if req.callers == 0 && req.cancel != nil {
+				req.cancel()
+			}
+			req.mu.Unlock()
+		case <-req.ready:
+		case <-doneMonitor:
+		}
+	}()
 
 	newInst, err := s.launchInstance(loadCtx, m)
 
@@ -667,12 +720,22 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 	s.tuningMu.Lock()
 	defer s.tuningMu.Unlock()
 
+	now := time.Now().UTC()
 	s.mu.Lock()
 	s.tuningActiveModel = m.ID
+	s.tuningStartedAt = now
+	s.tuningCurrentCtx = 0
+	s.tuningCurrentOffload = 0
+	s.tuningProbeCount = 0
+	budget := s.tuningBudget
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.tuningActiveModel = ""
+		s.tuningStartedAt = time.Time{}
+		s.tuningCurrentCtx = 0
+		s.tuningCurrentOffload = 0
+		s.tuningProbeCount = 0
 		s.mu.Unlock()
 	}()
 
@@ -696,11 +759,71 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 		maxOffload = 100 // fallback
 	}
 
+	budgetCtx, cancel := context.WithTimeout(loadCtx, budget)
+	defer cancel()
+
+	fallback := func(reason string) (host.Instance, error) {
+		slog.Warn("tuning budget exhausted, falling back to conservative known-safe configuration",
+			"model", m.ID,
+			"budget", budget,
+			"reason", reason,
+		)
+
+		fallbackCtx := uint64(2048)
+		if ctxLen < fallbackCtx {
+			fallbackCtx = ctxLen
+		}
+		fallbackCfg := tunedConfig{CtxLen: fallbackCtx, Offload: 0}
+
+		launchCtx := loadCtx
+		if launchCtx.Err() != nil {
+			var launchCancel context.CancelFunc
+			launchCtx, launchCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			defer launchCancel()
+		}
+
+		finalInst, err := s.launchConfig(launchCtx, m, fallbackCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to launch conservative fallback configuration after budget exhaustion: %w", err)
+		}
+
+		entry := TuningEntry{
+			ModelID:      m.ID,
+			ModelDigest:  m.Digest,
+			Fingerprint:  s.host.Fingerprint(),
+			RequestedCtx: ctxLen,
+			KVCacheType:  "f16",
+			Offload:      fallbackCfg.Offload,
+			ResultingCtx: fallbackCfg.CtxLen,
+			Allocation:   finalInst.ObservedAllocation(),
+			MeasuredAt:   time.Now().UTC(),
+		}
+		s.mu.Lock()
+		s.tuned[m.ID] = entry
+		s.saveTuningCacheLocked()
+		s.mu.Unlock()
+
+		return finalInst, nil
+	}
+
 	var lastErr error
 
 	for _, currentCtx := range ladder {
+		if budgetCtx.Err() != nil {
+			if loadCtx.Err() != nil {
+				return nil, loadCtx.Err()
+			}
+			return fallback(budgetCtx.Err().Error())
+		}
+
 		cfg := tunedConfig{CtxLen: currentCtx, Offload: maxOffload}
-		inst, err := s.launchConfig(loadCtx, m, cfg)
+		s.mu.Lock()
+		s.tuningCurrentCtx = cfg.CtxLen
+		s.tuningCurrentOffload = cfg.Offload
+		s.tuningProbeCount++
+		s.mu.Unlock()
+
+		inst, err := s.launchConfig(budgetCtx, m, cfg)
 		if err == nil {
 			entry := TuningEntry{
 				ModelID:      m.ID,
@@ -720,6 +843,14 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 			return inst, nil
 		}
 		lastErr = err
+
+		if budgetCtx.Err() != nil {
+			if loadCtx.Err() != nil {
+				return nil, loadCtx.Err()
+			}
+			return fallback(budgetCtx.Err().Error())
+		}
+
 		if !host.IsOOM(err) {
 			return nil, fmt.Errorf("tuning aborted due to non-memory error: %w", err)
 		}
@@ -730,9 +861,22 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 		var found bool
 
 		for low <= high {
+			if budgetCtx.Err() != nil {
+				if loadCtx.Err() != nil {
+					return nil, loadCtx.Err()
+				}
+				return fallback(budgetCtx.Err().Error())
+			}
+
 			mid := low + (high-low)/2
 			cfg = tunedConfig{CtxLen: currentCtx, Offload: uint64(mid)}
-			probeInst, err := s.launchConfig(loadCtx, m, cfg)
+			s.mu.Lock()
+			s.tuningCurrentCtx = cfg.CtxLen
+			s.tuningCurrentOffload = cfg.Offload
+			s.tuningProbeCount++
+			s.mu.Unlock()
+
+			probeInst, err := s.launchConfig(budgetCtx, m, cfg)
 
 			if err == nil {
 				bestCfg = cfg
@@ -741,6 +885,12 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 				low = mid + 1
 			} else {
 				lastErr = err
+				if budgetCtx.Err() != nil {
+					if loadCtx.Err() != nil {
+						return nil, loadCtx.Err()
+					}
+					return fallback(budgetCtx.Err().Error())
+				}
 				if !host.IsOOM(err) {
 					return nil, fmt.Errorf("tuning aborted due to non-memory error: %w", err)
 				}
@@ -749,8 +899,20 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 		}
 
 		if found {
-			finalInst, err := s.launchConfig(loadCtx, m, bestCfg)
+			s.mu.Lock()
+			s.tuningCurrentCtx = bestCfg.CtxLen
+			s.tuningCurrentOffload = bestCfg.Offload
+			s.tuningProbeCount++
+			s.mu.Unlock()
+
+			finalInst, err := s.launchConfig(budgetCtx, m, bestCfg)
 			if err != nil {
+				if budgetCtx.Err() != nil {
+					if loadCtx.Err() != nil {
+						return nil, loadCtx.Err()
+					}
+					return fallback(budgetCtx.Err().Error())
+				}
 				return nil, fmt.Errorf("failed to launch best tuned configuration: %w", err)
 			}
 			entry := TuningEntry{
@@ -804,10 +966,20 @@ func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Inst
 	return s.tune(loadCtx, m)
 }
 
+// TuningProgress describes in-flight tuning status for an active model measurement.
+type TuningProgress struct {
+	StartedAt      time.Time `json:"started_at"`
+	ElapsedSeconds float64   `json:"elapsed_seconds"`
+	CurrentCtx     uint64    `json:"current_ctx"`
+	CurrentOffload uint64    `json:"current_offload"`
+	ProbeCount     int       `json:"probe_count"`
+}
+
 type tuningResponse struct {
 	Status      string                 `json:"status"`
 	ActiveModel string                 `json:"active_model,omitempty"`
 	Fingerprint string                 `json:"fingerprint"`
+	Progress    *TuningProgress        `json:"progress,omitempty"`
 	Entries     map[string]TuningEntry `json:"entries"`
 }
 
@@ -816,14 +988,23 @@ func (s *Supervisor) handleV1TuningGet(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	status := "idle"
+	var prog *TuningProgress
 	if s.tuningActiveModel != "" {
 		status = "tuning"
+		prog = &TuningProgress{
+			StartedAt:      s.tuningStartedAt,
+			ElapsedSeconds: time.Since(s.tuningStartedAt).Seconds(),
+			CurrentCtx:     s.tuningCurrentCtx,
+			CurrentOffload: s.tuningCurrentOffload,
+			ProbeCount:     s.tuningProbeCount,
+		}
 	}
 
 	resp := tuningResponse{
 		Status:      status,
 		ActiveModel: s.tuningActiveModel,
 		Fingerprint: s.host.Fingerprint(),
+		Progress:    prog,
 		Entries:     make(map[string]TuningEntry, len(s.tuned)),
 	}
 	for id, entry := range s.tuned {

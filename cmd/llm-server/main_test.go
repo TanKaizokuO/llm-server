@@ -34,7 +34,7 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), tmpDir)
+		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, tmpDir)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -58,7 +58,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
-	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), tmpDir)
+	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, tmpDir)
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
 	}
@@ -66,7 +66,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 
 func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
 	emptyDir := t.TempDir()
-	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), emptyDir)
+	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), 2*time.Minute, emptyDir)
 	if err == nil {
 		t.Fatal("expected error when no models found, got nil")
 	}

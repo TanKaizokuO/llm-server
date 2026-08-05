@@ -3,12 +3,15 @@ package supervisor_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/TanKaizokuO/llm-server/internal/host"
 	"github.com/TanKaizokuO/llm-server/internal/supervisor"
@@ -414,5 +417,171 @@ func TestTuning_NativeEndpoints(t *testing.T) {
 	sup.Handler().ServeHTTP(rrGet3, reqGet)
 	if !bytes.Contains(rrGet3.Body.Bytes(), []byte(`"entries":{}`)) {
 		t.Errorf("Expected entries to be empty after reset, got %s", rrGet3.Body.String())
+	}
+}
+
+func TestTuning_BudgetExceeded_FallbackToConservativeConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "test-budget-model.gguf", "llama", "Q4_K_M")
+	cachePath := filepath.Join(tmpDir, "tuning.json")
+
+	h := host.NewFakeHost()
+	// Set launch hook to delay probes so budget expires during tuning
+	h.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		time.Sleep(50 * time.Millisecond)
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	// Configure supervisor with a tight 20ms tuning budget
+	sup, err := supervisor.NewWithOpts(h, []string{tmpDir},
+		supervisor.WithCachePath(cachePath),
+		supervisor.WithTuningBudget(20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewWithOpts error = %v", err)
+	}
+
+	body := []byte(`{"model":"test-budget-model:q4_k_m"}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	sup.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected OK response after fallback, got %d. Body: %s", rr.Code, rr.Body.String())
+	}
+
+	// Verify that the final launch used conservative fallback configuration (-ngl 0)
+	lastLaunch := h.LastLaunch()
+	if lastLaunch == nil {
+		t.Fatal("Expected launch, got none")
+	}
+	hasNGL0 := false
+	for i, arg := range lastLaunch {
+		if arg == "-ngl" || arg == "--n-gpu-layers" {
+			if i+1 < len(lastLaunch) && lastLaunch[i+1] == "0" {
+				hasNGL0 = true
+			}
+		}
+	}
+	if !hasNGL0 {
+		t.Errorf("Expected fallback launch to use offload 0, got argv %v", lastLaunch)
+	}
+
+	// Verify native GET /v1/tuning reflects the fallback entry (Offload == 0)
+	reqGet := httptest.NewRequest("GET", "/v1/tuning", nil)
+	rrGet := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rrGet, reqGet)
+	if !bytes.Contains(rrGet.Body.Bytes(), []byte(`"offload":0`)) {
+		t.Errorf("Expected tuning entry offload to be 0, got %s", rrGet.Body.String())
+	}
+}
+
+func TestTuning_ProgressObservableOnNativeEndpoint(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "test-progress-model.gguf", "llama", "Q4_K_M")
+
+	h := host.NewFakeHost()
+	h.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		time.Sleep(100 * time.Millisecond)
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	sup, err := supervisor.New(h, tmpDir)
+	if err != nil {
+		t.Fatalf("New error = %v", err)
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		body := []byte(`{"model":"test-progress-model:q4_k_m"}`)
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		rr := httptest.NewRecorder()
+		sup.Handler().ServeHTTP(rr, req)
+	}()
+
+	// Wait briefly for tuning to begin
+	time.Sleep(30 * time.Millisecond)
+
+	// Issue GET /v1/tuning while tuning is in progress
+	reqGet := httptest.NewRequest("GET", "/v1/tuning", nil)
+	rrGet := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rrGet, reqGet)
+
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("GET /v1/tuning returned status %d", rrGet.Code)
+	}
+
+	var resp struct {
+		Status      string `json:"status"`
+		ActiveModel string `json:"active_model"`
+		Progress    *struct {
+			StartedAt      string  `json:"started_at"`
+			ElapsedSeconds float64 `json:"elapsed_seconds"`
+			CurrentCtx     uint64  `json:"current_ctx"`
+			CurrentOffload uint64  `json:"current_offload"`
+			ProbeCount     int     `json:"probe_count"`
+		} `json:"progress"`
+	}
+
+	if err := json.Unmarshal(rrGet.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Decoding /v1/tuning response: %v", err)
+	}
+
+	if resp.Status != "tuning" {
+		t.Errorf("Expected status 'tuning', got %q", resp.Status)
+	}
+	if !strings.Contains(resp.ActiveModel, "test-progress-model") {
+		t.Errorf("Expected active_model to contain test-progress-model, got %q", resp.ActiveModel)
+	}
+	if resp.Progress == nil {
+		t.Fatal("Expected progress object while tuning, got nil")
+	}
+	if resp.Progress.ProbeCount < 1 {
+		t.Errorf("Expected probe_count >= 1, got %d", resp.Progress.ProbeCount)
+	}
+
+	<-doneCh
+
+	// After completion, status should revert to idle and progress to nil
+	rrGet2 := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rrGet2, reqGet)
+	if bytes.Contains(rrGet2.Body.Bytes(), []byte(`"status":"tuning"`)) {
+		t.Errorf("Expected status idle after completion, got %s", rrGet2.Body.String())
+	}
+}
+
+func TestTuning_ClientDisconnectDoesNotTriggerFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "test-cancel-model.gguf", "llama", "Q4_K_M")
+
+	h := host.NewFakeHost()
+	h.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		time.Sleep(100 * time.Millisecond)
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	sup, err := supervisor.New(h, tmpDir)
+	if err != nil {
+		t.Fatalf("New error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	body := []byte(`{"model":"test-cancel-model:q4_k_m"}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)).WithContext(ctx)
+	rr := httptest.NewRecorder()
+
+	sup.Handler().ServeHTTP(rr, req)
+
+	// Since client context timed out/cancelled, no tuned entry should be recorded
+	reqGet := httptest.NewRequest("GET", "/v1/tuning", nil)
+	rrGet := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rrGet, reqGet)
+
+	if bytes.Contains(rrGet.Body.Bytes(), []byte("test-cancel-model")) {
+		t.Errorf("Expected no tuning entry after client cancellation, got %s", rrGet.Body.String())
 	}
 }
