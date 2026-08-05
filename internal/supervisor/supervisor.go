@@ -501,6 +501,8 @@ func (s *Supervisor) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /api/tags", s.handleAPITags)
+	mux.HandleFunc("POST /api/chat", s.handleAPIChat)
+	mux.HandleFunc("POST /api/generate", s.handleAPIGenerate)
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
 	mux.HandleFunc("GET /v1/tuning", s.handleV1TuningGet)
