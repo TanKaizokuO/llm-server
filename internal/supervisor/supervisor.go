@@ -85,6 +85,9 @@ var neverExpires = time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC)
 func (ri *residentInstance) ExpiresAt() time.Time {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
+	if ri.timerActive {
+		return time.Now().Add(ri.ttl)
+	}
 	if ri.ttl > 0 {
 		return ri.lastUsed.Add(ri.ttl)
 	}
@@ -642,7 +645,7 @@ type ollamaModelDetails struct {
 }
 
 func modelDetails(m Model) ollamaModelDetails {
-	var families []string
+	var families any
 	if m.Architecture != "" {
 		families = []string{m.Architecture}
 	}

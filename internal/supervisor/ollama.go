@@ -39,8 +39,8 @@ type ollamaGenerateRequest struct {
 	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
 }
 
-// defaultOllamaVersion is the version string returned to Ollama clients during handshake.
-const defaultOllamaVersion = "0.5.0"
+// ollamaAPIVersion is the version string returned to Ollama clients during handshake.
+const ollamaAPIVersion = "0.5.0"
 
 type ollamaVersionResponse struct {
 	Version string `json:"version"`
@@ -77,7 +77,7 @@ type ollamaPSResponse struct {
 }
 
 func (s *Supervisor) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, ollamaVersionResponse{Version: defaultOllamaVersion})
+	writeJSON(w, http.StatusOK, ollamaVersionResponse{Version: ollamaAPIVersion})
 }
 
 func (s *Supervisor) handleAPIShow(w http.ResponseWriter, r *http.Request) {
@@ -98,9 +98,13 @@ func (s *Supervisor) handleAPIShow(w http.ResponseWriter, r *http.Request) {
 	m, err := s.resolveModel(ref)
 	if err != nil {
 		var notFound *ModelNotFoundError
-		var ambig *AmbiguousModelError
-		if errors.As(err, &notFound) || errors.As(err, &ambig) {
+		if errors.As(err, &notFound) {
 			writeOllamaError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		var ambig *AmbiguousModelError
+		if errors.As(err, &ambig) {
+			writeOllamaError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeOllamaError(w, http.StatusInternalServerError, err.Error())
@@ -116,10 +120,14 @@ func (s *Supervisor) handleAPIShow(w http.ResponseWriter, r *http.Request) {
 	} else {
 		modelInfo["general.context_length"] = m.ContextLength
 	}
+	parameters := ""
+	if m.ContextLength > 0 {
+		parameters = fmt.Sprintf("num_ctx %d", m.ContextLength)
+	}
 
 	res := ollamaShowResponse{
 		Modelfile:  fmt.Sprintf("FROM %s", m.ID),
-		Parameters: fmt.Sprintf("num_ctx %d", m.ContextLength),
+		Parameters: parameters,
 		Template:   "",
 		Details:    modelDetails(m),
 		ModelInfo:  modelInfo,
@@ -135,20 +143,23 @@ func (s *Supervisor) handleAPIPs(w http.ResponseWriter, r *http.Request) {
 	for id, ri := range s.instances {
 		m, ok := s.models[id]
 		if !ok {
-			continue
+			m = Model{
+				ID:   id,
+				Name: id,
+			}
 		}
 		active, max := ri.Occupancy()
 		expiresAt := ri.ExpiresAt()
 
 		vram := m.Size
+		alloc := ri.inst.ObservedAllocation()
+		if alloc.VRAM > 0 || alloc.RAM > 0 {
+			vram = alloc.VRAM
+		}
+
 		ctxLen := m.ContextLength
-		if te, ok := s.tuned[id]; ok {
-			if te.Allocation.VRAM > 0 {
-				vram = te.Allocation.VRAM
-			}
-			if te.ResultingCtx > 0 {
-				ctxLen = te.ResultingCtx
-			}
+		if te, ok := s.tuned[id]; ok && te.ResultingCtx > 0 {
+			ctxLen = te.ResultingCtx
 		}
 
 		models = append(models, ollamaPSModel{
