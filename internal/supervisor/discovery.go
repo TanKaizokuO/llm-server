@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,33 @@ var (
 
 	genericQuantRegex = regexp.MustCompile(`(?i)[._-]([i]?q[0-9]_[a-z0-9_]+|q[0-9]_[0-9]|f16|f32)$`)
 )
+
+// ConventionalModelDirs returns the conventional cache and data locations
+// where other local-LLM tools (LM Studio, GPT4All) store GGUF files. The
+// zero-config path scans these alongside any directories given explicitly,
+// so an operator never needs a configuration entry just to be found.
+func ConventionalModelDirs() []string {
+	var dirs []string
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return dirs
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
+		dirs = append(dirs, filepath.Join(home, "Library", "Application Support", "nomic.ai", "GPT4All"))
+	case "windows":
+		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
+		if appData := os.Getenv("LOCALAPPDATA"); appData != "" {
+			dirs = append(dirs, filepath.Join(appData, "nomic.ai", "GPT4All"))
+		}
+	default:
+		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
+		dirs = append(dirs, filepath.Join(home, ".local", "share", "nomic.ai", "GPT4All"))
+	}
+	return dirs
+}
 
 // discoverModels recursively scans the given directories for valid GGUF models.
 // It skips projectors, corrupt/unparseable files, and non-first shards.

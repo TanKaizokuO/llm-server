@@ -41,8 +41,10 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	addr := fs.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
 	cachePath := fs.String("tuning-cache", "tuning.json", "path to the tuning cache JSON file")
+	configPath := fs.String("config", "", "path to an optional JSON configuration file overriding per-model argv, TTL, slots, and tuned values")
 	budget := fs.Duration("tuning-budget", 2*time.Minute, "maximum duration allowed for a single tuning run")
 	idleTTL := fs.Duration("idle-ttl", 5*time.Minute, "default idle TTL for resident instances")
+	rescanInterval := fs.Duration("rescan-interval", 30*time.Second, "interval for periodic background directory rescans (0 disables)")
 	maxInstances := fs.Int("max-instances", 0, "maximum number of resident instances allowed (0 = uncapped)")
 	slots := fs.Int("slots", 1, "number of concurrent slots per instance")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -52,7 +54,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr, *cachePath, *budget, *idleTTL, *maxInstances, *slots, fs.Args()...)
+	return runServer(parentCtx, *addr, *cachePath, *configPath, *budget, *idleTTL, *rescanInterval, *maxInstances, *slots, fs.Args()...)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -93,15 +95,16 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr string, cachePath string, budget time.Duration, idleTTL time.Duration, maxInstances int, slots int, dirs ...string) error {
-	if len(dirs) == 0 {
-		dirs = []string{"."}
-	}
+func runServer(parentCtx context.Context, addr, cachePath, configPath string, budget, idleTTL, rescanInterval time.Duration, maxInstances, slots int, dirs ...string) error {
+	scanDirs := append(supervisor.ConventionalModelDirs(), dirs...)
+
 	h := host.New()
-	sup, err := supervisor.NewWithOpts(h, dirs,
+	sup, err := supervisor.NewWithOpts(h, scanDirs,
 		supervisor.WithCachePath(cachePath),
+		supervisor.WithConfigFile(configPath),
 		supervisor.WithTuningBudget(budget),
 		supervisor.WithDefaultTTL(idleTTL),
+		supervisor.WithRescanInterval(rescanInterval),
 		supervisor.WithMaxInstances(maxInstances),
 		supervisor.WithSlotsPerInstance(slots),
 	)

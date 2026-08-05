@@ -283,6 +283,40 @@ type tunedConfig struct {
 	Offload uint64
 }
 
+// TunedConfig pins a Model's launch flags verbatim, bypassing empirical
+// measurement entirely. It is never written to the Tuning cache file: it is
+// a static override supplied by the operator, re-applied on every launch.
+type TunedConfig struct {
+	CtxLen  uint64 `json:"ctx_len"`
+	Offload uint64 `json:"offload"`
+}
+
+// ModelConfig specifies configuration overrides for a specific Model. Every
+// field is optional; an unset field falls through to the Supervisor's
+// computed or global default.
+type ModelConfig struct {
+	// Argv is appended to the launch argv the Supervisor computes for this
+	// Model (after -m/-c/-ngl/-np), letting an operator add flags llama-server
+	// supports that the Supervisor has no opinion about.
+	Argv []string `json:"argv,omitempty"`
+	// TTL overrides the default idle TTL for this Model. Parsed with
+	// time.ParseDuration (e.g. "5m", "30s").
+	TTL string `json:"ttl,omitempty"`
+	// Slots overrides the default Slot count for this Model.
+	Slots *int `json:"slots,omitempty"`
+	// Tuned pins this Model's context length and offload verbatim, skipping
+	// measurement entirely.
+	Tuned *TunedConfig `json:"tuned,omitempty"`
+}
+
+// Config represents the optional configuration file's overrides. Config
+// exists to override per-Model settings, never to enumerate Models:
+// discovery alone determines what is servable, and an entry here is looked
+// up by Model ID, name, path, or filename — never required.
+type Config struct {
+	Models map[string]ModelConfig `json:"models"`
+}
+
 // Option configures optional parameters on a Supervisor.
 type Option func(*Supervisor)
 
@@ -290,6 +324,24 @@ type Option func(*Supervisor)
 func WithCachePath(path string) Option {
 	return func(s *Supervisor) {
 		s.cachePath = path
+	}
+}
+
+// WithConfigFile sets the path to the optional configuration file. The file
+// overrides per-Model argv, TTL, Slot count, and tuned values; its absence
+// is not an error — Model discovery alone is enough to serve every Model.
+func WithConfigFile(path string) Option {
+	return func(s *Supervisor) {
+		s.configPath = path
+	}
+}
+
+// WithRescanInterval sets how often the Supervisor re-scans its configured
+// directories in the background. A value <= 0 disables periodic rescanning;
+// Rescan can still be triggered on demand.
+func WithRescanInterval(d time.Duration) Option {
+	return func(s *Supervisor) {
+		s.rescanInterval = d
 	}
 }
 
@@ -373,6 +425,12 @@ type Supervisor struct {
 	modelTTLs            map[string]time.Duration
 	maxInstances         int
 	slotsPerInstance     int
+	configPath           string
+	config               Config
+	dirs                 []string
+	rescanInterval       time.Duration
+	rescanStop           chan struct{}
+	rescanStopOnce       sync.Once
 	closed               bool
 }
 
@@ -419,12 +477,25 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 		defaultTTL:       5 * time.Minute,
 		modelTTLs:        make(map[string]time.Duration),
 		slotsPerInstance: 1,
+		dirs:             dirs,
+		rescanInterval:   30 * time.Second,
+		rescanStop:       make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
 	s.loadTuningCache()
+
+	if s.configPath != "" {
+		if err := s.loadConfig(); err != nil {
+			return nil, err
+		}
+	}
+
+	if s.rescanInterval > 0 {
+		s.startRescanTimer()
+	}
 
 	return s, nil
 }
@@ -510,6 +581,138 @@ func (s *Supervisor) saveTuningCacheLocked() {
 	}
 }
 
+// loadConfig reads and validates the optional configuration file at
+// s.configPath. Model overrides are looked up lazily against live Model
+// data (see resolveModelConfig), so a config entry for a Model that has not
+// been discovered yet — or is added by a later Rescan — is not an error.
+func (s *Supervisor) loadConfig() error {
+	data, err := os.ReadFile(s.configPath)
+	if err != nil {
+		return fmt.Errorf("reading config file %q: %w", s.configPath, err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parsing config file %q: %w", s.configPath, err)
+	}
+
+	for ref, mc := range cfg.Models {
+		if mc.TTL != "" {
+			if _, err := time.ParseDuration(mc.TTL); err != nil {
+				return fmt.Errorf("config file %q: model %q: invalid ttl %q: %w", s.configPath, ref, mc.TTL, err)
+			}
+		}
+		if mc.Slots != nil && *mc.Slots <= 0 {
+			return fmt.Errorf("config file %q: model %q: slots must be positive, got %d", s.configPath, ref, *mc.Slots)
+		}
+	}
+
+	s.config = cfg
+	return nil
+}
+
+// resolveModelConfig looks up m's configuration override, matching by ID,
+// then Name, then Path, then base filename — the same precedence
+// resolveTTLLocked already uses for runtime TTL overrides. s.config is
+// populated once at startup and never mutated afterward, so this is safe
+// to call without holding s.mu.
+func (s *Supervisor) resolveModelConfig(m Model) (ModelConfig, bool) {
+	if mc, ok := s.config.Models[m.ID]; ok {
+		return mc, true
+	}
+	if mc, ok := s.config.Models[m.Name]; ok {
+		return mc, true
+	}
+	if mc, ok := s.config.Models[m.Path]; ok {
+		return mc, true
+	}
+	if mc, ok := s.config.Models[filepath.Base(m.Path)]; ok {
+		return mc, true
+	}
+	return ModelConfig{}, false
+}
+
+// resolveSlots returns m's configured Slot count, falling back to the
+// Supervisor-wide default.
+func (s *Supervisor) resolveSlots(m Model) int {
+	if mc, ok := s.resolveModelConfig(m); ok && mc.Slots != nil {
+		return *mc.Slots
+	}
+	return s.slotsPerInstance
+}
+
+// resolveArgv returns extra argv appended to m's computed launch command.
+func (s *Supervisor) resolveArgv(m Model) []string {
+	if mc, ok := s.resolveModelConfig(m); ok {
+		return mc.Argv
+	}
+	return nil
+}
+
+// resolveTunedOverride returns m's pinned Tuned configuration, if the
+// operator configured one. A pinned value bypasses measurement entirely and
+// is never written to the Tuning cache file.
+func (s *Supervisor) resolveTunedOverride(m Model) (TunedConfig, bool) {
+	if mc, ok := s.resolveModelConfig(m); ok && mc.Tuned != nil {
+		return *mc.Tuned, true
+	}
+	return TunedConfig{}, false
+}
+
+// Rescan re-scans the Supervisor's configured directories for Models,
+// picking up newly added or removed GGUF files. It never restarts resident
+// Instances or requires a restart of the Supervisor itself.
+func (s *Supervisor) Rescan() error {
+	s.mu.RLock()
+	dirs := s.dirs
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		return errors.New("supervisor is closed")
+	}
+
+	models, err := discoverModels(dirs)
+	if err != nil {
+		return err
+	}
+
+	modelMap := make(map[string]Model, len(models))
+	for _, m := range models {
+		modelMap[m.ID] = m
+	}
+
+	s.mu.Lock()
+	s.models = modelMap
+	s.modelsList = models
+	s.mu.Unlock()
+	return nil
+}
+
+// startRescanTimer launches the background goroutine that calls Rescan on
+// s.rescanInterval, until Close stops it.
+func (s *Supervisor) startRescanTimer() {
+	ticker := time.NewTicker(s.rescanInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := s.Rescan(); err != nil {
+					slog.Warn("periodic rescan failed", "err", err)
+				}
+			case <-s.rescanStop:
+				return
+			}
+		}
+	}()
+}
+
+// stopRescanTimer signals the background rescan goroutine to exit. Safe to
+// call multiple times or when no timer was started.
+func (s *Supervisor) stopRescanTimer() {
+	s.rescanStopOnce.Do(func() { close(s.rescanStop) })
+}
+
 // Handler returns the Supervisor's HTTP router. This is the single router the
 // binary serves and the one tests drive; there is no separate test wiring.
 func (s *Supervisor) Handler() http.Handler {
@@ -533,6 +736,8 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tuning", s.handleV1TuningGet)
 	mux.HandleFunc("POST /api/tuning/reset", s.handleV1TuningReset)
 	mux.HandleFunc("DELETE /api/tuning", s.handleV1TuningReset)
+	mux.HandleFunc("POST /v1/rescan", s.handleV1Rescan)
+	mux.HandleFunc("POST /api/rescan", s.handleV1Rescan)
 	return mux
 }
 
@@ -592,6 +797,8 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 
 // Close stops all resident Instances supervised by the daemon.
 func (s *Supervisor) Close() error {
+	s.stopRescanTimer()
+
 	s.mu.Lock()
 	s.closed = true
 	instancesToStop := make([]host.Instance, 0, len(s.instances))
@@ -895,6 +1102,11 @@ func (s *Supervisor) resolveTTLLocked(modelID string) time.Duration {
 		if ttl, ok := s.modelTTLs[filepath.Base(m.Path)]; ok {
 			return ttl
 		}
+		if mc, ok := s.resolveModelConfig(m); ok && mc.TTL != "" {
+			if d, err := time.ParseDuration(mc.TTL); err == nil {
+				return d
+			}
+		}
 	}
 	return s.defaultTTL
 }
@@ -1069,7 +1281,7 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 					s.evictLRULocked()
 				}
 				ttl := s.resolveTTLLocked(m.ID)
-				resInst = newResidentInstance(m.ID, newInst, ttl, s.slotsPerInstance)
+				resInst = newResidentInstance(m.ID, newInst, ttl, s.resolveSlots(m))
 				if !resInst.acquire(ctx) {
 					instToStop = newInst
 					req.inst = nil
@@ -1144,8 +1356,9 @@ func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunedCon
 		"-m", m.Path,
 		"-c", strconv.FormatUint(cfg.CtxLen, 10),
 		"-ngl", strconv.FormatUint(cfg.Offload, 10),
-		"-np", strconv.Itoa(s.slotsPerInstance),
+		"-np", strconv.Itoa(s.resolveSlots(m)),
 	}
+	argv = append(argv, s.resolveArgv(m)...)
 
 	newInst, err := s.host.Launch(loadCtx, argv)
 	if err != nil {
@@ -1385,6 +1598,11 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 }
 
 func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
+	if tuned, ok := s.resolveTunedOverride(m); ok {
+		cfg := tunedConfig{CtxLen: tuned.CtxLen, Offload: tuned.Offload}
+		return s.launchConfig(loadCtx, m, cfg)
+	}
+
 	s.mu.RLock()
 	entry, ok := s.tuned[m.ID]
 	s.mu.RUnlock()
@@ -1511,6 +1729,26 @@ func (s *Supervisor) handleV1TuningReset(w http.ResponseWriter, r *http.Request)
 		"status":  "ok",
 		"message": "all tuning cache entries reset",
 	})
+}
+
+// rescanResponse reports the outcome of an on-demand directory rescan.
+type rescanResponse struct {
+	Status string `json:"status"`
+	Models int    `json:"models"`
+}
+
+// handleV1Rescan triggers an on-demand re-scan of the Supervisor's
+// configured directories, so a newly dropped GGUF becomes servable without
+// a restart.
+func (s *Supervisor) handleV1Rescan(w http.ResponseWriter, r *http.Request) {
+	if err := s.Rescan(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error", "message": err.Error()})
+		return
+	}
+	s.mu.RLock()
+	n := len(s.modelsList)
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, rescanResponse{Status: "ok", Models: n})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

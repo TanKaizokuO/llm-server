@@ -34,7 +34,7 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, tmpDir)
+		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, tmpDir)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -58,7 +58,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
-	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, tmpDir)
+	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, tmpDir)
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
 	}
@@ -66,12 +66,48 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 
 func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
 	emptyDir := t.TempDir()
-	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, emptyDir)
+	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, emptyDir)
 	if err == nil {
 		t.Fatal("expected error when no models found, got nil")
 	}
 	if !strings.Contains(err.Error(), "no models found") {
 		t.Errorf("err = %v, want error containing 'no models found'", err)
+	}
+}
+
+// TestRunServer_ScansConventionalDirsWithNoCLIDirs covers: "With no
+// configuration file the Supervisor scans conventional cache and data
+// locations plus any directories given on the command line." With zero CLI
+// dirs, a Model sitting only under a conventional cache directory must
+// still be discovered — proven by runServer not failing with "no models
+// found" even though no directory was passed on the command line.
+func TestRunServer_ScansConventionalDirsWithNoCLIDirs(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	modelsDir := filepath.Join(fakeHome, ".cache", "lm-studio", "models")
+	if err := os.MkdirAll(modelsDir, 0755); err != nil {
+		t.Fatalf("creating conventional models dir: %v", err)
+	}
+	createTestModelFile(t, modelsDir, "conventional-model.gguf")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runServer(ctx, "127.0.0.1:0", filepath.Join(fakeHome, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("runServer returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runServer did not exit after context cancellation")
 	}
 }
 func TestRunCLI_MaxInstancesFlag(t *testing.T) {
