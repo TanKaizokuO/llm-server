@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,140 @@ type ollamaGenerateRequest struct {
 	Stream    *bool           `json:"stream,omitempty"`
 	Options   json.RawMessage `json:"options,omitempty"`
 	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
+}
+
+// defaultOllamaVersion is the version string returned to Ollama clients during handshake.
+const defaultOllamaVersion = "0.5.0"
+
+type ollamaVersionResponse struct {
+	Version string `json:"version"`
+}
+
+type ollamaShowRequest struct {
+	Model string `json:"model"`
+	Name  string `json:"name"`
+}
+
+type ollamaShowResponse struct {
+	Modelfile  string             `json:"modelfile"`
+	Parameters string             `json:"parameters"`
+	Template   string             `json:"template"`
+	Details    ollamaModelDetails `json:"details"`
+	ModelInfo  map[string]any     `json:"model_info"`
+}
+
+type ollamaPSModel struct {
+	Name          string             `json:"name"`
+	Model         string             `json:"model"`
+	Size          int64              `json:"size"`
+	Digest        string             `json:"digest"`
+	Details       ollamaModelDetails `json:"details"`
+	ExpiresAt     time.Time          `json:"expires_at"`
+	SizeVRAM      int64              `json:"size_vram"`
+	ContextLength uint64             `json:"context_length"`
+	ActiveSlots   int                `json:"active_slots"`
+	MaxSlots      int                `json:"max_slots"`
+}
+
+type ollamaPSResponse struct {
+	Models []ollamaPSModel `json:"models"`
+}
+
+func (s *Supervisor) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, ollamaVersionResponse{Version: defaultOllamaVersion})
+}
+
+func (s *Supervisor) handleAPIShow(w http.ResponseWriter, r *http.Request) {
+	var req ollamaShowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeOllamaError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ref := req.Model
+	if ref == "" {
+		ref = req.Name
+	}
+	if ref == "" {
+		writeOllamaError(w, http.StatusBadRequest, "model name is required")
+		return
+	}
+
+	m, err := s.resolveModel(ref)
+	if err != nil {
+		var notFound *ModelNotFoundError
+		var ambig *AmbiguousModelError
+		if errors.As(err, &notFound) || errors.As(err, &ambig) {
+			writeOllamaError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeOllamaError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	modelInfo := map[string]any{
+		"general.architecture": m.Architecture,
+	}
+	if m.Architecture != "" {
+		modelInfo[fmt.Sprintf("%s.context_length", m.Architecture)] = m.ContextLength
+		modelInfo[fmt.Sprintf("%s.block_count", m.Architecture)] = m.BlockCount
+	} else {
+		modelInfo["general.context_length"] = m.ContextLength
+	}
+
+	res := ollamaShowResponse{
+		Modelfile:  fmt.Sprintf("FROM %s", m.ID),
+		Parameters: fmt.Sprintf("num_ctx %d", m.ContextLength),
+		Template:   "",
+		Details:    modelDetails(m),
+		ModelInfo:  modelInfo,
+	}
+
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Supervisor) handleAPIPs(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	models := make([]ollamaPSModel, 0, len(s.instances))
+
+	for id, ri := range s.instances {
+		m, ok := s.models[id]
+		if !ok {
+			continue
+		}
+		active, max := ri.Occupancy()
+		expiresAt := ri.ExpiresAt()
+
+		vram := m.Size
+		ctxLen := m.ContextLength
+		if te, ok := s.tuned[id]; ok {
+			if te.Allocation.VRAM > 0 {
+				vram = te.Allocation.VRAM
+			}
+			if te.ResultingCtx > 0 {
+				ctxLen = te.ResultingCtx
+			}
+		}
+
+		models = append(models, ollamaPSModel{
+			Name:          m.ID,
+			Model:         m.ID,
+			Size:          m.Size,
+			Digest:        m.Digest,
+			Details:       modelDetails(m),
+			ExpiresAt:     expiresAt,
+			SizeVRAM:      vram,
+			ContextLength: ctxLen,
+			ActiveSlots:   active,
+			MaxSlots:      max,
+		})
+	}
+	s.mu.RUnlock()
+
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].Name < models[j].Name
+	})
+
+	writeJSON(w, http.StatusOK, ollamaPSResponse{Models: models})
 }
 
 type ollamaChatIntermediateChunk struct {

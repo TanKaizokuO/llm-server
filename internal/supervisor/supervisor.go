@@ -79,6 +79,18 @@ func (ri *residentInstance) getLastUsed() time.Time {
 	return ri.lastUsed
 }
 
+// neverExpires is the sentinel timestamp reported to Ollama clients for instances with infinite TTL.
+var neverExpires = time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC)
+
+func (ri *residentInstance) ExpiresAt() time.Time {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	if ri.ttl > 0 {
+		return ri.lastUsed.Add(ri.ttl)
+	}
+	return neverExpires
+}
+
 func (ri *residentInstance) acquire(ctx context.Context) bool {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
@@ -503,6 +515,9 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tags", s.handleAPITags)
 	mux.HandleFunc("POST /api/chat", s.handleAPIChat)
 	mux.HandleFunc("POST /api/generate", s.handleAPIGenerate)
+	mux.HandleFunc("GET /api/version", s.handleAPIVersion)
+	mux.HandleFunc("POST /api/show", s.handleAPIShow)
+	mux.HandleFunc("GET /api/ps", s.handleAPIPs)
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
 	mux.HandleFunc("GET /v1/tuning", s.handleV1TuningGet)
@@ -626,6 +641,20 @@ type ollamaModelDetails struct {
 	QuantizationLevel string `json:"quantization_level"`
 }
 
+func modelDetails(m Model) ollamaModelDetails {
+	var families []string
+	if m.Architecture != "" {
+		families = []string{m.Architecture}
+	}
+	return ollamaModelDetails{
+		Format:            "gguf",
+		Family:            m.Architecture,
+		Families:          families,
+		ParameterSize:     "",
+		QuantizationLevel: m.Quantization,
+	}
+}
+
 type ollamaModel struct {
 	Name       string             `json:"name"`
 	Model      string             `json:"model"`
@@ -655,13 +684,7 @@ func (s *Supervisor) handleAPITags(w http.ResponseWriter, r *http.Request) {
 			ModifiedAt: m.ModTime,
 			Size:       m.Size,
 			Digest:     m.Digest,
-			Details: ollamaModelDetails{
-				Format:            "gguf",
-				Family:            m.Architecture,
-				Families:          nil,
-				ParameterSize:     "",
-				QuantizationLevel: m.Quantization,
-			},
+			Details:    modelDetails(m),
 		})
 	}
 

@@ -468,3 +468,192 @@ func TestOllama_ParseKeepAliveVariants(t *testing.T) {
 		})
 	}
 }
+func TestOllama_APIVersion(t *testing.T) {
+	srv, _ := newTestServer(t)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/version")
+	if err != nil {
+		t.Fatalf("GET /api/version: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var res struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res.Version == "" {
+		t.Errorf("version is empty")
+	}
+}
+
+func TestOllama_APIShow(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, _ := newTestServer(t, tmpDir)
+	defer srv.Close()
+
+	// 1. Success case using model key
+	body := `{"model":"llama-3-8b:q4_k_m"}`
+	resp, err := http.Post(srv.URL+"/api/show", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/show: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var showRes struct {
+		Modelfile  string `json:"modelfile"`
+		Parameters string `json:"parameters"`
+		Template   string `json:"template"`
+		Details    struct {
+			Format            string `json:"format"`
+			Family            string `json:"family"`
+			QuantizationLevel string `json:"quantization_level"`
+		} `json:"details"`
+		ModelInfo map[string]any `json:"model_info"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&showRes); err != nil {
+		t.Fatalf("failed to decode show response: %v", err)
+	}
+
+	if showRes.Details.Format != "gguf" {
+		t.Errorf("details.format = %q, want gguf", showRes.Details.Format)
+	}
+	if showRes.Details.Family != "llama" {
+		t.Errorf("details.family = %q, want llama", showRes.Details.Family)
+	}
+	if showRes.Details.QuantizationLevel != "Q4_K_M" {
+		t.Errorf("details.quantization_level = %q, want Q4_K_M", showRes.Details.QuantizationLevel)
+	}
+
+	if arch, ok := showRes.ModelInfo["general.architecture"].(string); !ok || arch != "llama" {
+		t.Errorf("model_info[general.architecture] = %v, want llama", showRes.ModelInfo["general.architecture"])
+	}
+	if _, ok := showRes.ModelInfo["llama.context_length"]; !ok {
+		t.Errorf("model_info[llama.context_length] missing")
+	}
+
+	if !strings.Contains(showRes.Modelfile, "llama-3-8b:q4_k_m") {
+		t.Errorf("modelfile = %q, expected to contain model ID", showRes.Modelfile)
+	}
+
+	// 2. Success case using name key
+	bodyName := `{"name":"llama-3-8b:q4_k_m"}`
+	respName, err := http.Post(srv.URL+"/api/show", "application/json", strings.NewReader(bodyName))
+	if err != nil {
+		t.Fatalf("POST /api/show (name): %v", err)
+	}
+	respName.Body.Close()
+	if respName.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 for name parameter", respName.StatusCode)
+	}
+
+	// 3. Not found error
+	bodyNotFound := `{"model":"nonexistent:tag"}`
+	respNotFound, err := http.Post(srv.URL+"/api/show", "application/json", strings.NewReader(bodyNotFound))
+	if err != nil {
+		t.Fatalf("POST /api/show not found: %v", err)
+	}
+	respNotFound.Body.Close()
+	if respNotFound.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for unknown model", respNotFound.StatusCode)
+	}
+
+	// 4. Bad request error (empty body / no model specified)
+	bodyEmpty := `{}`
+	respEmpty, err := http.Post(srv.URL+"/api/show", "application/json", strings.NewReader(bodyEmpty))
+	if err != nil {
+		t.Fatalf("POST /api/show empty: %v", err)
+	}
+	respEmpty.Body.Close()
+	if respEmpty.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for empty request", respEmpty.StatusCode)
+	}
+}
+
+func TestOllama_APIPs(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	srv, _ := newTestServer(t, tmpDir)
+	defer srv.Close()
+
+	// 1. Initial GET /api/ps -> no resident instances
+	resp, err := http.Get(srv.URL + "/api/ps")
+	if err != nil {
+		t.Fatalf("GET /api/ps: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var psRes struct {
+		Models []struct {
+			Name        string `json:"name"`
+			Model       string `json:"model"`
+			Size        int64  `json:"size"`
+			SizeVRAM    int64  `json:"size_vram"`
+			ActiveSlots int    `json:"active_slots"`
+			MaxSlots    int    `json:"max_slots"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&psRes); err != nil {
+		t.Fatalf("failed to decode ps response: %v", err)
+	}
+	if len(psRes.Models) != 0 {
+		t.Errorf("got %d models before load, want 0", len(psRes.Models))
+	}
+
+	// 2. Trigger non-streaming chat request to make llama-3-8b:q4_k_m resident
+	chatBody := `{"model":"llama-3-8b:q4_k_m","messages":[{"role":"user","content":"Hi"}],"stream":false}`
+	chatResp, err := http.Post(srv.URL+"/api/chat", "application/json", strings.NewReader(chatBody))
+	if err != nil {
+		t.Fatalf("POST /api/chat: %v", err)
+	}
+	chatResp.Body.Close()
+
+	// 3. GET /api/ps -> should report resident model and slot info
+	respResident, err := http.Get(srv.URL + "/api/ps")
+	if err != nil {
+		t.Fatalf("GET /api/ps after load: %v", err)
+	}
+	defer respResident.Body.Close()
+
+	if respResident.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", respResident.StatusCode)
+	}
+
+	if err := json.NewDecoder(respResident.Body).Decode(&psRes); err != nil {
+		t.Fatalf("failed to decode ps response after load: %v", err)
+	}
+	if len(psRes.Models) != 1 {
+		t.Fatalf("got %d models after load, want 1", len(psRes.Models))
+	}
+
+	m := psRes.Models[0]
+	if m.Name != "llama-3-8b:q4_k_m" {
+		t.Errorf("model.name = %q, want llama-3-8b:q4_k_m", m.Name)
+	}
+	if m.Size <= 0 {
+		t.Errorf("model.size = %d, want > 0", m.Size)
+	}
+	if m.SizeVRAM <= 0 {
+		t.Errorf("model.size_vram = %d, want > 0", m.SizeVRAM)
+	}
+	if m.MaxSlots < 1 {
+		t.Errorf("model.max_slots = %d, want >= 1", m.MaxSlots)
+	}
+}
