@@ -19,6 +19,7 @@ type FakeHost struct {
 	fingerprint  string
 	accelerators []Accelerator
 	launches     [][]string
+	instances    []Instance
 	onLaunch     func(argv []string) (http.Handler, error)
 }
 
@@ -120,6 +121,14 @@ func (f *FakeHost) Launches() [][]string {
 	return result
 }
 
+// Instances returns all currently active and stopped fake instances.
+func (f *FakeHost) Instances() []Instance {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]Instance, len(f.instances))
+	copy(cp, f.instances)
+	return cp
+}
 // LastLaunch returns a deep copy of the most recent argv passed to Launch, or nil if none.
 func (f *FakeHost) LastLaunch() []string {
 	f.mu.Lock()
@@ -166,6 +175,11 @@ func (f *FakeHost) Launch(ctx context.Context, argv []string) (Instance, error) 
 		url:    parsedURL,
 		done:   done,
 	}
+
+	f.mu.Lock()
+	f.instances = append(f.instances, inst)
+	f.mu.Unlock()
+
 	return inst, nil
 }
 

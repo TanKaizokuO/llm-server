@@ -552,29 +552,7 @@ func TestModelResolution_BareNameReturnsErrorWhenAmbiguous(t *testing.T) {
 	}
 }
 
-type trackingHost struct {
-	host.Host
-	mu        sync.Mutex
-	instances []host.Instance
-}
 
-func (t *trackingHost) Launch(ctx context.Context, argv []string) (host.Instance, error) {
-	inst, err := t.Host.Launch(ctx, argv)
-	if err == nil {
-		t.mu.Lock()
-		t.instances = append(t.instances, inst)
-		t.mu.Unlock()
-	}
-	return inst, err
-}
-
-func (t *trackingHost) Instances() []host.Instance {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	cp := make([]host.Instance, len(t.instances))
-	copy(cp, t.instances)
-	return cp
-}
 
 func TestRegistry_LoadCoalescence(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -688,9 +666,8 @@ func TestRegistry_DeadInstanceReapedAndRestarted(t *testing.T) {
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 
 	fakeHost := host.NewFakeHost()
-	tracker := &trackingHost{Host: fakeHost}
 
-	sup, err := supervisor.New(tracker, tmpDir)
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("supervisor.New: %v", err)
 	}
@@ -708,7 +685,7 @@ func TestRegistry_DeadInstanceReapedAndRestarted(t *testing.T) {
 	}
 	resp1.Body.Close()
 
-	insts := tracker.Instances()
+	insts := fakeHost.Instances()
 	if len(insts) != 1 {
 		t.Fatalf("expected 1 instance launched, got %d", len(insts))
 	}
@@ -740,9 +717,8 @@ func TestRegistry_CloseStopsAllInstances(t *testing.T) {
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 
 	fakeHost := host.NewFakeHost()
-	tracker := &trackingHost{Host: fakeHost}
 
-	sup, err := supervisor.New(tracker, tmpDir)
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("supervisor.New: %v", err)
 	}
@@ -757,7 +733,7 @@ func TestRegistry_CloseStopsAllInstances(t *testing.T) {
 	}
 	resp1.Body.Close()
 
-	insts := tracker.Instances()
+	insts := fakeHost.Instances()
 	if len(insts) != 1 {
 		t.Fatalf("expected 1 instance launched, got %d", len(insts))
 	}
@@ -780,8 +756,8 @@ func TestRegistry_CloseStopsAllInstances(t *testing.T) {
 		t.Fatalf("post-close POST: %v", err)
 	}
 	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusInternalServerError {
-		t.Errorf("post-close status = %d, want %d", resp2.StatusCode, http.StatusInternalServerError)
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("post-close status = %d, want %d", resp2.StatusCode, http.StatusServiceUnavailable)
 	}
 }
 
@@ -790,9 +766,8 @@ func TestRegistry_EvictStopsAndRemovesInstance(t *testing.T) {
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 
 	fakeHost := host.NewFakeHost()
-	tracker := &trackingHost{Host: fakeHost}
 
-	sup, err := supervisor.New(tracker, tmpDir)
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("supervisor.New: %v", err)
 	}
@@ -808,7 +783,7 @@ func TestRegistry_EvictStopsAndRemovesInstance(t *testing.T) {
 	}
 	resp1.Body.Close()
 
-	insts := tracker.Instances()
+	insts := fakeHost.Instances()
 	if len(insts) != 1 {
 		t.Fatalf("expected 1 instance launched, got %d", len(insts))
 	}
@@ -838,8 +813,8 @@ func TestRegistry_EvictStopsAndRemovesInstance(t *testing.T) {
 	}
 
 	// Evicting a non-resident model should return nil without error
-	if err := sup.Evict(context.Background(), "non-existent-model"); err != nil {
-		t.Errorf("Evict(non-existent) error = %v, want nil", err)
+	if err := sup.Evict(context.Background(), "non-existent-model"); err == nil {
+		t.Errorf("Evict(non-existent) error = nil, want error")
 	}
 }
 
@@ -848,7 +823,7 @@ func TestRegistry_EvictWhileLoading(t *testing.T) {
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 
 	fakeHost := host.NewFakeHost()
-	tracker := &trackingHost{Host: fakeHost}
+
 	launchStarted := make(chan struct{})
 	launchRelease := make(chan struct{})
 	var once sync.Once
@@ -861,7 +836,7 @@ func TestRegistry_EvictWhileLoading(t *testing.T) {
 		return http.HandlerFunc(host.DefaultMockHandler), nil
 	})
 
-	sup, err := supervisor.New(tracker, tmpDir)
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("supervisor.New: %v", err)
 	}
@@ -895,7 +870,7 @@ func TestRegistry_EvictWhileLoading(t *testing.T) {
 	}
 
 	// Check that the loaded instance was stopped
-	insts := tracker.Instances()
+	insts := fakeHost.Instances()
 	if len(insts) == 1 {
 		select {
 		case <-insts[0].Done():
@@ -911,7 +886,7 @@ func TestRegistry_CloseWhileLoading(t *testing.T) {
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
 
 	fakeHost := host.NewFakeHost()
-	tracker := &trackingHost{Host: fakeHost}
+
 	launchStarted := make(chan struct{})
 	launchRelease := make(chan struct{})
 	var once sync.Once
@@ -924,7 +899,7 @@ func TestRegistry_CloseWhileLoading(t *testing.T) {
 		return http.HandlerFunc(host.DefaultMockHandler), nil
 	})
 
-	sup, err := supervisor.New(tracker, tmpDir)
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("supervisor.New: %v", err)
 	}
@@ -957,7 +932,7 @@ func TestRegistry_CloseWhileLoading(t *testing.T) {
 	}
 
 	// Check that the launched instance was stopped
-	insts := tracker.Instances()
+	insts := fakeHost.Instances()
 	if len(insts) == 1 {
 		select {
 		case <-insts[0].Done():

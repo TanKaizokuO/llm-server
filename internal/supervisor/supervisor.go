@@ -25,10 +25,20 @@ import (
 	"github.com/TanKaizokuO/llm-server/internal/host"
 )
 
-type loadRequest struct {
-	ready chan struct{}
-	inst  host.Instance
-	err   error
+type pendingInstance struct {
+	ready  chan struct{}
+	cancel context.CancelFunc
+	inst   host.Instance
+	err    error
+}
+
+func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration) error {
+	if inst == nil {
+		return nil
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return inst.Stop(stopCtx)
 }
 
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
@@ -39,7 +49,7 @@ type Supervisor struct {
 	models     map[string]Model
 	modelsList []Model
 	instances  map[string]host.Instance
-	loading    map[string]*loadRequest
+	loading    map[string]*pendingInstance
 	closed     bool
 }
 
@@ -68,7 +78,7 @@ func New(h host.Host, dirs ...string) (*Supervisor, error) {
 		models:     modelMap,
 		modelsList: models,
 		instances:  make(map[string]host.Instance),
-		loading:    make(map[string]*loadRequest),
+		loading:    make(map[string]*pendingInstance),
 	}, nil
 }
 
@@ -90,24 +100,25 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 		ctx = context.Background()
 	}
 	m, err := s.resolveModel(ref)
-	modelID := ref
-	if err == nil {
-		modelID = m.ID
+	if err != nil {
+		return err
 	}
+	modelID := m.ID
 
 	s.mu.Lock()
-	inst, ok := s.instances[modelID]
-	if ok {
+	inst, resident := s.instances[modelID]
+	if resident {
 		delete(s.instances, modelID)
 	}
 	req, loading := s.loading[modelID]
+	if loading && req != nil && req.cancel != nil {
+		req.cancel()
+	}
 	s.mu.Unlock()
 
 	var stopErr error
-	if ok && inst != nil {
-		stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		stopErr = inst.Stop(stopCtx)
+	if resident {
+		stopErr = stopInstance(ctx, inst, 10*time.Second)
 	}
 
 	if loading && req != nil {
@@ -120,9 +131,7 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 			}
 			s.mu.Unlock()
 			if loadedOk && loadedInst != nil {
-				stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				if err := loadedInst.Stop(stopCtx); err != nil && stopErr == nil {
+				if err := stopInstance(ctx, loadedInst, 10*time.Second); err != nil && stopErr == nil {
 					stopErr = err
 				}
 			}
@@ -145,18 +154,15 @@ func (s *Supervisor) Close() error {
 		instancesToStop = append(instancesToStop, inst)
 	}
 	s.instances = make(map[string]host.Instance)
-	inFlight := make([]*loadRequest, 0, len(s.loading))
+	inFlight := make([]*pendingInstance, 0, len(s.loading))
 	for _, req := range s.loading {
 		inFlight = append(inFlight, req)
 	}
 	s.mu.Unlock()
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	var errs []error
 	for _, inst := range instancesToStop {
-		if err := inst.Stop(stopCtx); err != nil {
+		if err := stopInstance(context.Background(), inst, 10*time.Second); err != nil {
 			errs = append(errs, fmt.Errorf("stopping instance: %w", err))
 		}
 	}
@@ -165,12 +171,12 @@ func (s *Supervisor) Close() error {
 		select {
 		case <-req.ready:
 			if req.inst != nil {
-				if err := req.inst.Stop(stopCtx); err != nil {
+				if err := stopInstance(context.Background(), req.inst, 10*time.Second); err != nil {
 					errs = append(errs, fmt.Errorf("stopping in-flight instance: %w", err))
 				}
 			}
-		case <-stopCtx.Done():
-			errs = append(errs, fmt.Errorf("timed out waiting for in-flight load to stop: %w", stopCtx.Err()))
+		case <-time.After(10 * time.Second):
+			errs = append(errs, errors.New("timed out waiting for in-flight load to stop"))
 		}
 	}
 
@@ -341,9 +347,9 @@ func (s *Supervisor) resolveModel(ref string) (Model, error) {
 		return matches[0], nil
 	}
 
-	tags := make([]string, 0, len(matches))
-	for _, m := range matches {
-		tags = append(tags, m.Tag)
+	tags := make([]string, len(matches))
+	for i, m := range matches {
+		tags[i] = strings.ToLower(m.Quantization)
 	}
 	return Model{}, &AmbiguousModelError{Name: ref, Tags: tags}
 }
@@ -380,20 +386,30 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 
 	inst, err := s.getOrLaunchInstance(r.Context(), model)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "", "internal_error")
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		status := http.StatusInternalServerError
+		code := "internal_error"
+		if err.Error() == "supervisor is closed" {
+			status = http.StatusServiceUnavailable
+			code = "service_unavailable"
+		}
+		writeOpenAIError(w, status, err.Error(), "", code)
 		return
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(inst.URL())
+		Director: func(req *http.Request) {
+			req.URL.Scheme = inst.URL().Scheme
+			req.URL.Host = inst.URL().Host
 		},
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("proxy error: %v", err), "", "bad_gateway")
+			writeOpenAIError(w, http.StatusServiceUnavailable, fmt.Sprintf("proxy error: %v", err), "", "service_unavailable")
 		},
 	}
 	proxy.ServeHTTP(w, r)
@@ -429,22 +445,25 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 		}
 	}
 
-	req := &loadRequest{ready: make(chan struct{})}
+	loadCtx, loadCancel := context.WithCancel(context.Background())
+	req := &pendingInstance{
+		ready:  make(chan struct{}),
+		cancel: loadCancel,
+	}
 	s.loading[m.ID] = req
 	s.mu.Unlock()
 
-	newInst, err := s.launchInstance(m)
+	newInst, err := s.launchInstance(loadCtx, m)
 
 	s.mu.Lock()
 	delete(s.loading, m.ID)
 	req.inst = newInst
 	req.err = err
 
+	var instToStop host.Instance
 	if err == nil {
 		if s.closed {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = newInst.Stop(stopCtx)
+			instToStop = newInst
 			req.inst = nil
 			req.err = errors.New("supervisor is closed")
 		} else {
@@ -454,13 +473,17 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 	close(req.ready)
 	s.mu.Unlock()
 
+	if instToStop != nil {
+		_ = stopInstance(context.Background(), instToStop, 5*time.Second)
+	}
+
 	if req.err != nil {
 		return nil, req.err
 	}
 	return req.inst, nil
 }
 
-func (s *Supervisor) launchInstance(m Model) (host.Instance, error) {
+func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
 	ctxLen := m.ContextLength
 	if ctxLen == 0 {
 		ctxLen = 2048
@@ -472,18 +495,16 @@ func (s *Supervisor) launchInstance(m Model) (host.Instance, error) {
 		"-np", "1",
 	}
 
-	newInst, err := s.host.Launch(context.Background(), argv)
+	newInst, err := s.host.Launch(loadCtx, argv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to launch instance: %w", err)
 	}
 
-	readyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	readyCtx, cancel := context.WithTimeout(loadCtx, 30*time.Second)
 	defer cancel()
 
 	if err := newInst.WaitReady(readyCtx); err != nil {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stopCancel()
-		_ = newInst.Stop(stopCtx)
+		_ = stopInstance(context.Background(), newInst, 5*time.Second)
 		return nil, fmt.Errorf("instance failed readiness: %w", err)
 	}
 
