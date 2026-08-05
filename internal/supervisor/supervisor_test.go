@@ -3,6 +3,7 @@ package supervisor_test
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1151,5 +1152,282 @@ func TestTTL_ZeroTTLNeverExpires(t *testing.T) {
 		t.Fatal("instance stopped when TTL was set to 0 (infinite)")
 	default:
 		// OK, still running
+	}
+}
+func writePreTunedCache(t *testing.T, dir string, fh *host.FakeHost, modelFilenames ...string) {
+	t.Helper()
+	entries := make(map[string]any)
+	fp := fh.Fingerprint()
+	for _, fname := range modelFilenames {
+		stem := strings.TrimSuffix(fname, ".gguf")
+		id := stem + ":q4_k_m"
+		path := filepath.Join(dir, fname)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("statting %s: %v", path, err)
+		}
+		h := sha256.New()
+		_, _ = fmt.Fprintf(h, "%s:%s:%d", id, path, info.Size())
+		digest := fmt.Sprintf("sha256:%x", h.Sum(nil))
+
+		entries[id] = map[string]any{
+			"model_id":      id,
+			"model_digest":  digest,
+			"fingerprint":   fp,
+			"requested_ctx": uint64(4096),
+			"kv_cache_type": "f16",
+			"offload":       uint64(0),
+			"resulting_ctx": uint64(4096),
+			"allocation": map[string]any{
+				"vram": 1024,
+				"ram":  512,
+			},
+			"measured_at": time.Now().UTC(),
+		}
+	}
+	cache := map[string]any{
+		"fingerprint": fp,
+		"entries":     entries,
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatalf("marshaling tuning cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tuning.json"), data, 0644); err != nil {
+		t.Fatalf("writing tuning.json: %v", err)
+	}
+}
+func TestMaxInstances_CapsResidentInstancesAndEvictsLRU(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "model-b.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "model-c.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf", "model-b.gguf", "model-c.gguf")
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithDefaultTTL(0),
+		supervisor.WithMaxInstances(2),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	sendReq := func(model string) {
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/chat/completions for %s: %v", model, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d for model %s, want 200", resp.StatusCode, model)
+		}
+	}
+
+	// 1. Launch model-a
+	sendReq("model-a")
+	insts := fakeHost.Instances()
+	if len(insts) != 1 {
+		t.Fatalf("expected 1 instance launched, got %d", len(insts))
+	}
+	instA := insts[0]
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 2. Launch model-b
+	sendReq("model-b")
+	insts = fakeHost.Instances()
+	if len(insts) != 2 {
+		t.Fatalf("expected 2 instances launched, got %d", len(insts))
+	}
+	instB := insts[1]
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 3. Use model-a again to update its recency!
+	sendReq("model-a")
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 4. Launch model-c. This exceeds cap of 2, so model-b (LRU) should be evicted.
+	sendReq("model-c")
+
+	// Verify instB is stopped
+	select {
+	case <-instB.Done():
+		// OK, LRU instance model-b was evicted and stopped
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected model-b (LRU) instance to be evicted and stopped, but it was not")
+	}
+
+	// Verify instA is still running
+	select {
+	case <-instA.Done():
+		t.Fatal("expected model-a instance to remain running, but it was stopped")
+	default:
+		// OK
+	}
+}
+
+func TestMaxInstances_EvictionDrainsInFlightSlotWithoutKillingMidGeneration(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "model-b.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf", "model-b.gguf")
+	slowHandlerStarted := make(chan struct{})
+	slowHandlerRelease := make(chan struct{})
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			isModelA := false
+			for _, arg := range argv {
+				if strings.Contains(arg, "model-a.gguf") {
+					isModelA = true
+					break
+				}
+			}
+			if isModelA && r.URL.Path == "/v1/chat/completions" {
+				close(slowHandlerStarted)
+				<-slowHandlerRelease
+			}
+			host.DefaultMockHandler(w, r)
+		})
+		return h, nil
+	})
+
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithDefaultTTL(0),
+		supervisor.WithMaxInstances(1),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// 1. Send in-flight request to model-a
+	var modelAErr error
+	go func() {
+		body := `{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			modelAErr = err
+			return
+		}
+		resp.Body.Close()
+	}()
+
+	// Wait until model-a's request is in-flight
+	select {
+	case <-slowHandlerStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for model-a slow handler to start")
+	}
+
+	insts := fakeHost.Instances()
+	if len(insts) != 1 {
+		t.Fatalf("expected 1 instance launched, got %d", len(insts))
+	}
+	instA := insts[0]
+
+	// 2. Launch model-b while model-a is handling request.
+	// Cap is 1, so model-a is evicted.
+	var modelBErr error
+	modelBFinished := make(chan struct{})
+	go func() {
+		defer close(modelBFinished)
+		body := `{"model":"model-b","messages":[{"role":"user","content":"hi"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			modelBErr = err
+			return
+		}
+		resp.Body.Close()
+	}()
+
+	select {
+	case <-modelBFinished:
+		if modelBErr != nil {
+			t.Fatalf("model-b request failed: %v", modelBErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for model-b request to finish")
+	}
+
+	// Verify model-a instance has NOT stopped yet because request is in flight
+	select {
+	case <-instA.Done():
+		t.Fatal("model-a instance stopped while request was still in-flight!")
+	default:
+		// OK
+	}
+
+	// Release model-a's request
+	close(slowHandlerRelease)
+
+	// Now model-a instance should finish draining and stop
+	select {
+	case <-instA.Done():
+		// OK, stopped after in-flight generation finished
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected model-a instance to stop after in-flight generation completed")
+	}
+
+	if modelAErr != nil {
+		t.Errorf("model-a in-flight request experienced error: %v", modelAErr)
+	}
+}
+
+func TestMaxInstances_ZeroOrUncappedAllowsMultiple(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "model-b.gguf", "llama", "Q4_K_M")
+	writeTestGGUF(t, tmpDir, "model-c.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf", "model-b.gguf", "model-c.gguf")
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithDefaultTTL(0),
+		supervisor.WithMaxInstances(0),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	for _, model := range []string{"model-a", "model-b", "model-c"} {
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/chat/completions for %s: %v", model, err)
+		}
+		resp.Body.Close()
+	}
+
+	insts := fakeHost.Instances()
+	if len(insts) != 3 {
+		t.Fatalf("expected 3 instances launched, got %d", len(insts))
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	for i, inst := range insts {
+		select {
+		case <-inst.Done():
+			t.Fatalf("instance %d stopped when uncapped", i)
+		default:
+		}
 	}
 }

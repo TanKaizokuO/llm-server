@@ -46,18 +46,26 @@ type residentInstance struct {
 	stopped     bool
 	idleTimer   *time.Timer
 	timerActive bool
+	lastUsed    time.Time
 	mu          sync.Mutex
 	idleCond    *sync.Cond
 }
 
 func newResidentInstance(modelID string, inst host.Instance, ttl time.Duration) *residentInstance {
 	ri := &residentInstance{
-		modelID: modelID,
-		inst:    inst,
-		ttl:     ttl,
+		modelID:  modelID,
+		inst:     inst,
+		ttl:      ttl,
+		lastUsed: time.Now(),
 	}
 	ri.idleCond = sync.NewCond(&ri.mu)
 	return ri
+}
+
+func (ri *residentInstance) getLastUsed() time.Time {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	return ri.lastUsed
 }
 
 func (ri *residentInstance) acquire() bool {
@@ -74,6 +82,7 @@ func (ri *residentInstance) acquire() bool {
 	}
 
 	ri.activeCount++
+	ri.lastUsed = time.Now()
 	if ri.idleTimer != nil && ri.timerActive {
 		ri.idleTimer.Stop()
 		ri.timerActive = false
@@ -85,6 +94,7 @@ func (ri *residentInstance) release(s *Supervisor) {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 
+	ri.lastUsed = time.Now()
 	if ri.activeCount > 0 {
 		ri.activeCount--
 	}
@@ -117,13 +127,16 @@ func (ri *residentInstance) stopTimerAndMarkStopped() {
 	ri.idleCond.Broadcast()
 }
 
-func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
+func (ri *residentInstance) drainAndStop(s *Supervisor, reason string) {
 	ri.mu.Lock()
-	if ri.stopped || !ri.timerActive {
+	if ri.stopped {
 		ri.mu.Unlock()
 		return
 	}
-	ri.timerActive = false
+	if ri.idleTimer != nil && ri.timerActive {
+		ri.idleTimer.Stop()
+		ri.timerActive = false
+	}
 
 	if ri.activeCount > 0 {
 		ri.draining = true
@@ -145,8 +158,20 @@ func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
 	}
 	s.mu.Unlock()
 
-	slog.Info("resident instance expired after idle TTL", "model", ri.modelID, "ttl", ri.ttl)
+	slog.Info("resident instance stopped", "model", ri.modelID, "reason", reason)
 	_ = stopInstance(context.Background(), ri.inst, 10*time.Second)
+}
+
+func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
+	ri.mu.Lock()
+	if ri.stopped || !ri.timerActive {
+		ri.mu.Unlock()
+		return
+	}
+	ri.timerActive = false
+	ri.mu.Unlock()
+
+	ri.drainAndStop(s, "idle TTL expired")
 }
 
 func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration) error {
@@ -221,6 +246,19 @@ func WithModelTTL(modelRef string, d time.Duration) Option {
 	}
 }
 
+// WithMaxInstances sets the maximum number of resident instances allowed.
+// A value <= 0 means unlimited resident instances (uncapped).
+func WithMaxInstances(n int) Option {
+	return func(s *Supervisor) {
+		s.maxInstances = n
+	}
+}
+
+// WithMaxResidentInstances is an alias for WithMaxInstances.
+func WithMaxResidentInstances(n int) Option {
+	return WithMaxInstances(n)
+}
+
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // the Instance registry, and the Tuning cache.
 type Supervisor struct {
@@ -241,6 +279,7 @@ type Supervisor struct {
 	tuningBudget         time.Duration
 	defaultTTL           time.Duration
 	modelTTLs            map[string]time.Duration
+	maxInstances         int
 	closed               bool
 }
 
@@ -883,6 +922,9 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 			req.inst = nil
 			req.err = errors.New("supervisor is closed")
 		} else {
+			if s.maxInstances > 0 && len(s.instances) >= s.maxInstances {
+				s.evictLRULocked()
+			}
 			ttl := s.resolveTTLLocked(m.ID)
 			resInst = newResidentInstance(m.ID, newInst, ttl)
 			_ = resInst.acquire()
@@ -900,6 +942,33 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 		return nil, func() {}, req.err
 	}
 	return resInst.inst, func() { resInst.release(s) }, nil
+}
+
+func (s *Supervisor) evictLRULocked() {
+	var lruID string
+	var lruInst *residentInstance
+	var oldest time.Time
+
+	for id, ri := range s.instances {
+		last := ri.getLastUsed()
+		if lruInst == nil || last.Before(oldest) {
+			oldest = last
+			lruID = id
+			lruInst = ri
+		}
+	}
+
+	if lruInst != nil {
+		delete(s.instances, lruID)
+		lruInst.mu.Lock()
+		lruInst.draining = true
+		if lruInst.idleTimer != nil && lruInst.timerActive {
+			lruInst.idleTimer.Stop()
+			lruInst.timerActive = false
+		}
+		lruInst.mu.Unlock()
+		go lruInst.drainAndStop(s, "evicted by LRU cap")
+	}
 }
 
 func (s *Supervisor) evictAllResidentInstances() {
