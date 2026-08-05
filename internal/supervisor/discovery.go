@@ -52,17 +52,19 @@ func ConventionalModelDirs() []string {
 		return dirs
 	}
 
+	// LM Studio (modern & legacy) and llama.cpp default cache
+	dirs = append(dirs, filepath.Join(home, ".lmstudio", "models"))
+	dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
+	dirs = append(dirs, filepath.Join(home, ".cache", "llama.cpp"))
+
 	switch runtime.GOOS {
 	case "darwin":
-		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
 		dirs = append(dirs, filepath.Join(home, "Library", "Application Support", "nomic.ai", "GPT4All"))
 	case "windows":
-		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
 		if appData := os.Getenv("LOCALAPPDATA"); appData != "" {
 			dirs = append(dirs, filepath.Join(appData, "nomic.ai", "GPT4All"))
 		}
 	default:
-		dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
 		dirs = append(dirs, filepath.Join(home, ".local", "share", "nomic.ai", "GPT4All"))
 	}
 	return dirs
@@ -78,12 +80,16 @@ func discoverModels(dirs []string) ([]Model, error) {
 			continue
 		}
 
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			slog.Debug("skipping non-existent scan directory", "dir", dir)
+			continue
+		}
+
 		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				slog.Warn("failed to access path during model scan", "path", path, "err", err)
 				return nil
 			}
-
 			if d.IsDir() {
 				return nil
 			}

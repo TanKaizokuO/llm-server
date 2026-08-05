@@ -3,6 +3,7 @@ package supervisor_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -316,6 +317,28 @@ func TestConfig_NoModelRequiresConfigEntry(t *testing.T) {
 	}
 	if ttl != 9*time.Minute {
 		t.Errorf("GetModelTTL = %v, want default 9m", ttl)
+	}
+}
+
+// TestConfig_ArgvCannotOverrideReservedFlags ensures model config argv cannot
+// contain flags managed by the supervisor (-m, -c, -ngl, -np).
+func TestConfig_ArgvCannotOverrideReservedFlags(t *testing.T) {
+	reservedFlags := []string{"-m", "--model", "-c", "--ctx-size", "-ngl", "--n-gpu-layers", "-np", "--parallel"}
+	for _, flag := range reservedFlags {
+		t.Run(flag, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
+			configPath := writeTestConfig(t, tmpDir, "config.json", fmt.Sprintf(`{
+				"models": {
+					"model:q4_k_m": {"argv": ["%s", "value"]}
+				}
+			}`, flag))
+
+			_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
+			if err == nil {
+				t.Fatalf("expected NewWithOpts to fail when argv contains reserved flag %s", flag)
+			}
+		})
 	}
 }
 

@@ -612,6 +612,15 @@ func (s *Supervisor) loadConfig() error {
 			}
 			configTTL[ref] = d
 		}
+		for _, arg := range mc.Argv {
+			a := strings.ToLower(arg)
+			if a == "-m" || strings.HasPrefix(a, "--model") ||
+				a == "-c" || strings.HasPrefix(a, "--ctx-size") ||
+				a == "-ngl" || strings.HasPrefix(a, "--n-gpu-layers") ||
+				a == "-np" || strings.HasPrefix(a, "--parallel") {
+				return fmt.Errorf("config file %q: model %q: argv cannot override reserved flag %q", s.configPath, ref, arg)
+			}
+		}
 		if mc.Slots != nil && *mc.Slots <= 0 {
 			return fmt.Errorf("config file %q: model %q: slots must be positive, got %d", s.configPath, ref, *mc.Slots)
 		}
