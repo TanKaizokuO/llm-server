@@ -13,7 +13,7 @@ for why this shape was chosen.
 
 ## Status
 
-**In active development.** Tickets #3, #4, and #5 (Supervisor bootstrap, GGUF metadata reader, model discovery, and `/api/tags` & `/v1/models` list surfaces) are complete. Subprocess supervision, empirical tuning, and completion API surfaces are in progress across tracked issues (#6–#19).
+**In active development.** Tickets #3, #4, #5, #6, #7, and #8 (Supervisor bootstrap, GGUF metadata reader, model discovery, Model resolution, and real Host accelerator enumeration/fingerprinting/supervision) are complete. Empirical tuning and completion API surfaces are in progress across tracked issues (#9–#19).
 
 ## Build and run
 
@@ -31,4 +31,12 @@ CGO_ENABLED=0 go build -o llm-server ./cmd/llm-server
 
 ```sh
 go test -race ./...
+```
+
+### Real-Hardware Integration Tests
+
+Real-hardware tests in `internal/host/real_integration_test.go` exercise the real `Host` boundary against a physical GPU and a live `llama-server` process. They are build-tagged with `//go:build integration` and excluded from default test runs. This exclusion is a deliberate gap: unit test suites rely on `FakeHost` or helper subprocess mocks for fast, deterministic CI execution, while physical hardware suites are executed explicitly on GPU test nodes:
+
+```sh
+TEST_MODEL_PATH=/path/to/model.gguf go test -tags integration -race -v ./internal/host/...
 ```

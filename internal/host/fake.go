@@ -12,23 +12,45 @@ import (
 
 // FakeHost implements Host for unit and integration testing.
 type FakeHost struct {
-	mu          sync.Mutex
-	vramBudget  int64
-	ramBudget   int64
-	layerCost   int64
-	fingerprint string
-	launches    [][]string
-	onLaunch    func(argv []string) (http.Handler, error)
+	mu           sync.Mutex
+	vramBudget   int64
+	ramBudget    int64
+	layerCost    int64
+	fingerprint  string
+	accelerators []Accelerator
+	launches     [][]string
+	onLaunch     func(argv []string) (http.Handler, error)
 }
 
 // NewFakeHost constructs a FakeHost with synthetic hardware budget defaults.
 func NewFakeHost() *FakeHost {
-	return &FakeHost{
+	f := &FakeHost{
 		vramBudget:  24 * 1024 * 1024 * 1024, // 24 GiB VRAM default
 		ramBudget:   64 * 1024 * 1024 * 1024, // 64 GiB RAM default
 		layerCost:   500 * 1024 * 1024,       // 500 MiB per layer default
 		fingerprint: "fake-host-fingerprint",
 	}
+	f.accelerators = []Accelerator{
+		{ID: "gpu:0", Name: "Fake GPU 0", TotalMemory: f.vramBudget},
+	}
+	return f
+}
+
+// Accelerators returns the configured list of fake compute devices.
+func (f *FakeHost) Accelerators() []Accelerator {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]Accelerator, len(f.accelerators))
+	copy(cp, f.accelerators)
+	return cp
+}
+
+// SetAccelerators sets a custom list of fake compute devices.
+func (f *FakeHost) SetAccelerators(accs []Accelerator) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accelerators = make([]Accelerator, len(accs))
+	copy(f.accelerators, accs)
 }
 
 // SetBudget configures the synthetic hardware budget and per-layer cost.
@@ -38,6 +60,9 @@ func (f *FakeHost) SetBudget(vram, ram, layerCost int64) {
 	f.vramBudget = vram
 	f.ramBudget = ram
 	f.layerCost = layerCost
+	if len(f.accelerators) == 1 && f.accelerators[0].ID == "gpu:0" {
+		f.accelerators[0].TotalMemory = vram
+	}
 }
 
 // VRAMBudget returns the synthetic VRAM budget.
