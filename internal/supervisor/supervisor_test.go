@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -547,5 +549,421 @@ func TestModelResolution_BareNameReturnsErrorWhenAmbiguous(t *testing.T) {
 
 	if len(fakeHost.Launches()) != 0 {
 		t.Errorf("expected 0 Host launches for ambiguous model reference, got %d", len(fakeHost.Launches()))
+	}
+}
+
+type trackingHost struct {
+	host.Host
+	mu        sync.Mutex
+	instances []host.Instance
+}
+
+func (t *trackingHost) Launch(ctx context.Context, argv []string) (host.Instance, error) {
+	inst, err := t.Host.Launch(ctx, argv)
+	if err == nil {
+		t.mu.Lock()
+		t.instances = append(t.instances, inst)
+		t.mu.Unlock()
+	}
+	return inst, err
+}
+
+func (t *trackingHost) Instances() []host.Instance {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cp := make([]host.Instance, len(t.instances))
+	copy(cp, t.instances)
+	return cp
+}
+
+func TestRegistry_LoadCoalescence(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	slowLaunchStarted := make(chan struct{})
+	slowLaunchRelease := make(chan struct{})
+	var once sync.Once
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		once.Do(func() {
+			close(slowLaunchStarted)
+		})
+		<-slowLaunchRelease
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	sup, err := supervisor.New(fakeHost, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				errCh <- fmt.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+				return
+			}
+		}()
+	}
+
+	<-slowLaunchStarted
+	close(slowLaunchRelease)
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent request error: %v", err)
+	}
+
+	if len(fakeHost.Launches()) != 1 {
+		t.Errorf("expected exactly 1 Host launch for 10 coalesced requests, got %d", len(fakeHost.Launches()))
+	}
+}
+func TestRegistry_ResidentModelServedWithoutRelaunching(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.New(fakeHost, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+
+	// First request: loads model
+	resp1, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("first POST: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", resp1.StatusCode, http.StatusOK)
+	}
+
+	if len(fakeHost.Launches()) != 1 {
+		t.Fatalf("expected 1 launch after first request, got %d", len(fakeHost.Launches()))
+	}
+
+	// Second request: served from resident instance
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("second POST: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+
+	if len(fakeHost.Launches()) != 1 {
+		t.Errorf("expected resident model request to produce 0 extra launches, got total %d", len(fakeHost.Launches()))
+	}
+}
+
+func TestRegistry_DeadInstanceReapedAndRestarted(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	tracker := &trackingHost{Host: fakeHost}
+
+	sup, err := supervisor.New(tracker, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+
+	// 1. Initial request loads model
+	resp1, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("first POST: %v", err)
+	}
+	resp1.Body.Close()
+
+	insts := tracker.Instances()
+	if len(insts) != 1 {
+		t.Fatalf("expected 1 instance launched, got %d", len(insts))
+	}
+
+	// 2. Kill the running instance externally (simulate crash/unexpected exit)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := insts[0].Stop(stopCtx); err != nil {
+		t.Fatalf("stopping instance: %v", err)
+	}
+
+	// 3. Next request reaps dead instance and launches fresh one
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("second POST: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("second status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+
+	if len(fakeHost.Launches()) != 2 {
+		t.Errorf("expected 2 launches after reaping dead instance, got %d", len(fakeHost.Launches()))
+	}
+}
+
+func TestRegistry_CloseStopsAllInstances(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	tracker := &trackingHost{Host: fakeHost}
+
+	sup, err := supervisor.New(tracker, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp1, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp1.Body.Close()
+
+	insts := tracker.Instances()
+	if len(insts) != 1 {
+		t.Fatalf("expected 1 instance launched, got %d", len(insts))
+	}
+
+	if err := sup.Close(); err != nil {
+		t.Fatalf("sup.Close: %v", err)
+	}
+
+	// Verify the instance's Done channel is closed (stopped)
+	select {
+	case <-insts[0].Done():
+		// OK, stopped cleanly
+	case <-time.After(1 * time.Second):
+		t.Errorf("expected instance to be stopped on Supervisor.Close()")
+	}
+
+	// Verify new requests after Close fail cleanly
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post-close POST: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusInternalServerError {
+		t.Errorf("post-close status = %d, want %d", resp2.StatusCode, http.StatusInternalServerError)
+	}
+}
+
+func TestRegistry_EvictStopsAndRemovesInstance(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	tracker := &trackingHost{Host: fakeHost}
+
+	sup, err := supervisor.New(tracker, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp1, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("first POST: %v", err)
+	}
+	resp1.Body.Close()
+
+	insts := tracker.Instances()
+	if len(insts) != 1 {
+		t.Fatalf("expected 1 instance launched, got %d", len(insts))
+	}
+
+	// Evict the model
+	if err := sup.Evict(context.Background(), "llama-3-8b"); err != nil {
+		t.Fatalf("sup.Evict: %v", err)
+	}
+
+	// Verify instance stopped
+	select {
+	case <-insts[0].Done():
+		// OK
+	case <-time.After(1 * time.Second):
+		t.Errorf("expected instance to be stopped after Evict")
+	}
+
+	// Next request triggers fresh launch
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("second POST: %v", err)
+	}
+	resp2.Body.Close()
+
+	if len(fakeHost.Launches()) != 2 {
+		t.Errorf("expected 2 launches after Evict, got %d", len(fakeHost.Launches()))
+	}
+
+	// Evicting a non-resident model should return nil without error
+	if err := sup.Evict(context.Background(), "non-existent-model"); err != nil {
+		t.Errorf("Evict(non-existent) error = %v, want nil", err)
+	}
+}
+
+func TestRegistry_EvictWhileLoading(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	tracker := &trackingHost{Host: fakeHost}
+	launchStarted := make(chan struct{})
+	launchRelease := make(chan struct{})
+	var once sync.Once
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		once.Do(func() {
+			close(launchStarted)
+		})
+		<-launchRelease
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	sup, err := supervisor.New(tracker, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// Trigger load in background
+	go func() {
+		body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+		resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	<-launchStarted
+
+	// Call Evict while load is in-flight
+	evictDone := make(chan error, 1)
+	go func() {
+		evictDone <- sup.Evict(context.Background(), "llama-3-8b")
+	}()
+
+	// Release launch so it completes
+	close(launchRelease)
+
+	if err := <-evictDone; err != nil {
+		t.Errorf("Evict while loading error = %v, want nil", err)
+	}
+
+	// Check that the loaded instance was stopped
+	insts := tracker.Instances()
+	if len(insts) == 1 {
+		select {
+		case <-insts[0].Done():
+			// OK, stopped
+		case <-time.After(1 * time.Second):
+			t.Errorf("expected instance loaded during Evict to be stopped")
+		}
+	}
+}
+
+func TestRegistry_CloseWhileLoading(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	tracker := &trackingHost{Host: fakeHost}
+	launchStarted := make(chan struct{})
+	launchRelease := make(chan struct{})
+	var once sync.Once
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		once.Do(func() {
+			close(launchStarted)
+		})
+		<-launchRelease
+		return http.HandlerFunc(host.DefaultMockHandler), nil
+	})
+
+	sup, err := supervisor.New(tracker, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// Trigger load in background
+	go func() {
+		body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+		resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	<-launchStarted
+
+	// Close supervisor while load is in-flight
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- sup.Close()
+	}()
+
+	// Release launch
+	close(launchRelease)
+
+	if err := <-closeDone; err != nil {
+		t.Errorf("Close while loading error = %v, want nil", err)
+	}
+
+	// Check that the launched instance was stopped
+	insts := tracker.Instances()
+	if len(insts) == 1 {
+		select {
+		case <-insts[0].Done():
+			// OK, stopped
+		case <-time.After(1 * time.Second):
+			t.Errorf("expected in-flight instance to be stopped on Close()")
+		}
 	}
 }
