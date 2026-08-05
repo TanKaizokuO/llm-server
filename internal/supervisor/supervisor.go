@@ -37,6 +37,118 @@ type pendingInstance struct {
 	err     error
 }
 
+type residentInstance struct {
+	modelID     string
+	inst        host.Instance
+	ttl         time.Duration
+	activeCount int
+	draining    bool
+	stopped     bool
+	idleTimer   *time.Timer
+	timerActive bool
+	mu          sync.Mutex
+	idleCond    *sync.Cond
+}
+
+func newResidentInstance(modelID string, inst host.Instance, ttl time.Duration) *residentInstance {
+	ri := &residentInstance{
+		modelID: modelID,
+		inst:    inst,
+		ttl:     ttl,
+	}
+	ri.idleCond = sync.NewCond(&ri.mu)
+	return ri
+}
+
+func (ri *residentInstance) acquire() bool {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+
+	if ri.draining || ri.stopped {
+		return false
+	}
+	select {
+	case <-ri.inst.Done():
+		return false
+	default:
+	}
+
+	ri.activeCount++
+	if ri.idleTimer != nil && ri.timerActive {
+		ri.idleTimer.Stop()
+		ri.timerActive = false
+	}
+	return true
+}
+
+func (ri *residentInstance) release(s *Supervisor) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+
+	if ri.activeCount > 0 {
+		ri.activeCount--
+	}
+	if ri.activeCount == 0 {
+		ri.idleCond.Broadcast()
+		if ri.draining {
+			return
+		}
+		if ri.ttl > 0 && !ri.stopped {
+			if ri.idleTimer != nil {
+				ri.idleTimer.Stop()
+			}
+			ri.timerActive = true
+			ri.idleTimer = time.AfterFunc(ri.ttl, func() {
+				s.onInstanceIdleTimeout(ri)
+			})
+		}
+	}
+}
+
+func (ri *residentInstance) stopTimerAndMarkStopped() {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+
+	if ri.idleTimer != nil {
+		ri.idleTimer.Stop()
+		ri.timerActive = false
+	}
+	ri.stopped = true
+	ri.idleCond.Broadcast()
+}
+
+func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
+	ri.mu.Lock()
+	if ri.stopped || !ri.timerActive {
+		ri.mu.Unlock()
+		return
+	}
+	ri.timerActive = false
+
+	if ri.activeCount > 0 {
+		ri.draining = true
+		for ri.activeCount > 0 && !ri.stopped {
+			ri.idleCond.Wait()
+		}
+	}
+
+	if ri.stopped {
+		ri.mu.Unlock()
+		return
+	}
+	ri.stopped = true
+	ri.mu.Unlock()
+
+	s.mu.Lock()
+	if current, ok := s.instances[ri.modelID]; ok && current == ri {
+		delete(s.instances, ri.modelID)
+	}
+	s.mu.Unlock()
+
+	slog.Info("resident instance expired after idle TTL", "model", ri.modelID, "ttl", ri.ttl)
+	_ = stopInstance(context.Background(), ri.inst, 10*time.Second)
+}
+
 func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration) error {
 	if inst == nil {
 		return nil
@@ -87,6 +199,28 @@ func WithTuningBudget(d time.Duration) Option {
 	}
 }
 
+// WithDefaultTTL sets the default idle TTL for resident instances.
+func WithDefaultTTL(d time.Duration) Option {
+	return func(s *Supervisor) {
+		s.defaultTTL = d
+	}
+}
+
+// WithTTL is an alias for WithDefaultTTL.
+func WithTTL(d time.Duration) Option {
+	return WithDefaultTTL(d)
+}
+
+// WithModelTTL sets a per-model idle TTL override.
+func WithModelTTL(modelRef string, d time.Duration) Option {
+	return func(s *Supervisor) {
+		if s.modelTTLs == nil {
+			s.modelTTLs = make(map[string]time.Duration)
+		}
+		s.modelTTLs[modelRef] = d
+	}
+}
+
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // the Instance registry, and the Tuning cache.
 type Supervisor struct {
@@ -94,7 +228,7 @@ type Supervisor struct {
 	host                 host.Host
 	models               map[string]Model
 	modelsList           []Model
-	instances            map[string]host.Instance
+	instances            map[string]*residentInstance
 	loading              map[string]*pendingInstance
 	tuned                map[string]TuningEntry
 	tuningMu             sync.Mutex
@@ -105,6 +239,8 @@ type Supervisor struct {
 	tuningProbeCount     int
 	cachePath            string
 	tuningBudget         time.Duration
+	defaultTTL           time.Duration
+	modelTTLs            map[string]time.Duration
 	closed               bool
 }
 
@@ -143,11 +279,13 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 		host:         h,
 		models:       modelMap,
 		modelsList:   models,
-		instances:    make(map[string]host.Instance),
+		instances:    make(map[string]*residentInstance),
 		loading:      make(map[string]*pendingInstance),
 		tuned:        make(map[string]TuningEntry),
 		cachePath:    defaultCachePath,
 		tuningBudget: defaultBudget,
+		defaultTTL:   5 * time.Minute,
+		modelTTLs:    make(map[string]time.Duration),
 	}
 
 	for _, opt := range opts {
@@ -251,9 +389,10 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 	modelID := m.ID
 
 	s.mu.Lock()
-	inst, resident := s.instances[modelID]
+	resInst, resident := s.instances[modelID]
 	if resident {
 		delete(s.instances, modelID)
+		resInst.stopTimerAndMarkStopped()
 	}
 	req, loading := s.loading[modelID]
 	if loading && req != nil && req.cancel != nil {
@@ -263,20 +402,21 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 
 	var stopErr error
 	if resident {
-		stopErr = stopInstance(ctx, inst, 10*time.Second)
+		stopErr = stopInstance(ctx, resInst.inst, 10*time.Second)
 	}
 
 	if loading && req != nil {
 		select {
 		case <-req.ready:
 			s.mu.Lock()
-			loadedInst, loadedOk := s.instances[modelID]
+			loadedResInst, loadedOk := s.instances[modelID]
 			if loadedOk {
 				delete(s.instances, modelID)
+				loadedResInst.stopTimerAndMarkStopped()
 			}
 			s.mu.Unlock()
-			if loadedOk && loadedInst != nil {
-				if err := stopInstance(ctx, loadedInst, 10*time.Second); err != nil && stopErr == nil {
+			if loadedOk && loadedResInst != nil {
+				if err := stopInstance(ctx, loadedResInst.inst, 10*time.Second); err != nil && stopErr == nil {
 					stopErr = err
 				}
 			}
@@ -295,10 +435,11 @@ func (s *Supervisor) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	instancesToStop := make([]host.Instance, 0, len(s.instances))
-	for _, inst := range s.instances {
-		instancesToStop = append(instancesToStop, inst)
+	for _, resInst := range s.instances {
+		resInst.stopTimerAndMarkStopped()
+		instancesToStop = append(instancesToStop, resInst.inst)
 	}
-	s.instances = make(map[string]host.Instance)
+	s.instances = make(map[string]*residentInstance)
 	inFlight := make([]*pendingInstance, 0, len(s.loading))
 	for _, req := range s.loading {
 		inFlight = append(inFlight, req)
@@ -541,7 +682,7 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	inst, err := s.getOrLaunchInstance(r.Context(), model)
+	inst, release, err := s.getOrLaunchInstance(r.Context(), model)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
@@ -555,6 +696,7 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, status, err.Error(), "", code)
 		return
 	}
+	defer release()
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -571,21 +713,90 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 	proxy.ServeHTTP(w, r)
 }
+func (s *Supervisor) resolveTTLLocked(modelID string) time.Duration {
+	if ttl, ok := s.modelTTLs[modelID]; ok {
+		return ttl
+	}
+	if m, ok := s.models[modelID]; ok {
+		if ttl, ok := s.modelTTLs[m.Name]; ok {
+			return ttl
+		}
+		if ttl, ok := s.modelTTLs[m.Path]; ok {
+			return ttl
+		}
+		if ttl, ok := s.modelTTLs[filepath.Base(m.Path)]; ok {
+			return ttl
+		}
+	}
+	return s.defaultTTL
+}
 
-func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Instance, error) {
+// SetModelTTL sets a per-model idle TTL override at runtime.
+func (s *Supervisor) SetModelTTL(modelRef string, d time.Duration) error {
+	m, err := s.resolveModel(modelRef)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.modelTTLs == nil {
+		s.modelTTLs = make(map[string]time.Duration)
+	}
+	s.modelTTLs[m.ID] = d
+
+	ri, resident := s.instances[m.ID]
+	s.mu.Unlock()
+
+	if resident && ri != nil {
+		ri.mu.Lock()
+		ri.ttl = d
+		if ri.activeCount == 0 && !ri.draining && !ri.stopped {
+			if ri.idleTimer != nil {
+				ri.idleTimer.Stop()
+				ri.timerActive = false
+			}
+			if d > 0 {
+				ri.timerActive = true
+				ri.idleTimer = time.AfterFunc(d, func() {
+					s.onInstanceIdleTimeout(ri)
+				})
+			}
+		}
+		ri.mu.Unlock()
+	}
+
+	return nil
+}
+func (s *Supervisor) GetModelTTL(modelRef string) (time.Duration, error) {
+	m, err := s.resolveModel(modelRef)
+	if err != nil {
+		return 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.resolveTTLLocked(m.ID), nil
+}
+
+func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Instance, func(), error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil, errors.New("supervisor is closed")
+		return nil, func() {}, errors.New("supervisor is closed")
 	}
 
-	if inst, ok := s.instances[m.ID]; ok && inst != nil {
+	if resInst, ok := s.instances[m.ID]; ok && resInst != nil {
 		select {
-		case <-inst.Done():
+		case <-resInst.inst.Done():
+			resInst.stopTimerAndMarkStopped()
 			delete(s.instances, m.ID)
 		default:
-			s.mu.Unlock()
-			return inst, nil
+			if resInst.acquire() {
+				s.mu.Unlock()
+				return resInst.inst, func() { resInst.release(s) }, nil
+			}
+			delete(s.instances, m.ID)
 		}
 	}
 
@@ -614,11 +825,21 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 		select {
 		case <-req.ready:
 			if req.err != nil {
-				return nil, req.err
+				return nil, func() {}, req.err
 			}
-			return req.inst, nil
+			s.mu.Lock()
+			resInst, ok := s.instances[m.ID]
+			if ok && resInst != nil && resInst.acquire() {
+				s.mu.Unlock()
+				return resInst.inst, func() { resInst.release(s) }, nil
+			}
+			s.mu.Unlock()
+			if req.inst != nil {
+				return req.inst, func() {}, nil
+			}
+			return nil, func() {}, errors.New("instance unavailable after load")
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, func() {}, ctx.Err()
 		}
 	}
 
@@ -655,13 +876,17 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 	req.err = err
 
 	var instToStop host.Instance
+	var resInst *residentInstance
 	if err == nil {
 		if s.closed {
 			instToStop = newInst
 			req.inst = nil
 			req.err = errors.New("supervisor is closed")
 		} else {
-			s.instances[m.ID] = newInst
+			ttl := s.resolveTTLLocked(m.ID)
+			resInst = newResidentInstance(m.ID, newInst, ttl)
+			_ = resInst.acquire()
+			s.instances[m.ID] = resInst
 		}
 	}
 	close(req.ready)
@@ -672,16 +897,17 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 	}
 
 	if req.err != nil {
-		return nil, req.err
+		return nil, func() {}, req.err
 	}
-	return req.inst, nil
+	return resInst.inst, func() { resInst.release(s) }, nil
 }
 
 func (s *Supervisor) evictAllResidentInstances() {
 	s.mu.Lock()
 	var toStop []host.Instance
-	for id, inst := range s.instances {
-		toStop = append(toStop, inst)
+	for id, resInst := range s.instances {
+		resInst.stopTimerAndMarkStopped()
+		toStop = append(toStop, resInst.inst)
 		delete(s.instances, id)
 	}
 	s.mu.Unlock()

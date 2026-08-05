@@ -940,3 +940,216 @@ func TestRegistry_CloseWhileLoading(t *testing.T) {
 		}
 	}
 }
+func TestTTL_IdleInstanceStopsAfterTTL(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithDefaultTTL(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	insts := fakeHost.Instances()
+	if len(insts) == 0 {
+		t.Fatalf("expected 1 instance launched, got 0")
+	}
+	inst := insts[len(insts)-1]
+
+	select {
+	case <-inst.Done():
+		t.Fatal("instance stopped immediately before TTL elapsed")
+	default:
+	}
+
+	select {
+	case <-inst.Done():
+		// OK, stopped after TTL
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected instance to be stopped after 50ms TTL")
+	}
+}
+
+func TestTTL_PerModelTTLOverridesGlobalDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithDefaultTTL(5*time.Second),
+		supervisor.WithModelTTL("llama-3-8b.q4_k_m.gguf", 50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	ttl, err := sup.GetModelTTL("llama-3-8b")
+	if err != nil {
+		t.Fatalf("GetModelTTL: %v", err)
+	}
+	if ttl != 50*time.Millisecond {
+		t.Errorf("GetModelTTL = %v, want 50ms", ttl)
+	}
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	resp.Body.Close()
+
+	insts := fakeHost.Instances()
+	if len(insts) == 0 {
+		t.Fatalf("expected 1 instance launched")
+	}
+	inst := insts[len(insts)-1]
+
+	select {
+	case <-inst.Done():
+		// OK, stopped after per-model 50ms TTL
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected instance to stop after 50ms per-model TTL, but it did not stop within 500ms")
+	}
+
+	if err := sup.SetModelTTL("llama-3-8b", 200*time.Millisecond); err != nil {
+		t.Fatalf("SetModelTTL: %v", err)
+	}
+	ttl, _ = sup.GetModelTTL("llama-3-8b")
+	if ttl != 200*time.Millisecond {
+		t.Errorf("after SetModelTTL, GetModelTTL = %v, want 200ms", ttl)
+	}
+}
+
+func TestTTL_ExpiryDrainsInFlightSlotWithoutKillingMidGeneration(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	slowHandlerStarted := make(chan struct{})
+	slowHandlerRelease := make(chan struct{})
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/chat/completions" {
+				close(slowHandlerStarted)
+				<-slowHandlerRelease
+			}
+			host.DefaultMockHandler(w, r)
+		})
+		return h, nil
+	})
+
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithDefaultTTL(30*time.Millisecond))
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	<-slowHandlerStarted
+
+	insts := fakeHost.Instances()
+	if len(insts) == 0 {
+		t.Fatalf("expected 1 instance launched")
+	}
+	inst := insts[len(insts)-1]
+
+	time.Sleep(60 * time.Millisecond)
+
+	select {
+	case <-inst.Done():
+		t.Fatal("instance was killed mid-generation before slot drained!")
+	default:
+	}
+
+	close(slowHandlerRelease)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("request failed: %v", err)
+	case resp := <-respCh:
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		resp.Body.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for response")
+	}
+
+	select {
+	case <-inst.Done():
+		// OK, stopped after slot drained
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected instance to stop after in-flight slot completed and drained")
+	}
+}
+
+func TestTTL_ZeroTTLNeverExpires(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithDefaultTTL(0))
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"llama-3-8b","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	resp.Body.Close()
+
+	insts := fakeHost.Instances()
+	if len(insts) == 0 {
+		t.Fatalf("expected 1 instance launched")
+	}
+	inst := insts[len(insts)-1]
+
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-inst.Done():
+		t.Fatal("instance stopped when TTL was set to 0 (infinite)")
+	default:
+		// OK, still running
+	}
+}

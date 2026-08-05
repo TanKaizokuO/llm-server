@@ -42,6 +42,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 	addr := fs.String("addr", defaultAddr, "address to serve the Ollama, OpenAI, and native surfaces on")
 	cachePath := fs.String("tuning-cache", "tuning.json", "path to the tuning cache JSON file")
 	budget := fs.Duration("tuning-budget", 2*time.Minute, "maximum duration allowed for a single tuning run")
+	idleTTL := fs.Duration("idle-ttl", 5*time.Minute, "default idle TTL for resident instances")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -49,7 +50,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr, *cachePath, *budget, fs.Args()...)
+	return runServer(parentCtx, *addr, *cachePath, *budget, *idleTTL, fs.Args()...)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -90,7 +91,7 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr string, cachePath string, budget time.Duration, dirs ...string) error {
+func runServer(parentCtx context.Context, addr string, cachePath string, budget time.Duration, idleTTL time.Duration, dirs ...string) error {
 	if len(dirs) == 0 {
 		dirs = []string{"."}
 	}
@@ -98,6 +99,7 @@ func runServer(parentCtx context.Context, addr string, cachePath string, budget 
 	sup, err := supervisor.NewWithOpts(h, dirs,
 		supervisor.WithCachePath(cachePath),
 		supervisor.WithTuningBudget(budget),
+		supervisor.WithDefaultTTL(idleTTL),
 	)
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)
