@@ -29,6 +29,7 @@ func createTestModelFile(t *testing.T, dir, filename string) string {
 }
 
 func TestRunGracefulShutdownOnSignal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
@@ -55,6 +56,7 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 }
 
 func TestRunFailsOnInvalidAddress(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
@@ -65,6 +67,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 }
 
 func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	emptyDir := t.TempDir()
 	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, emptyDir)
 	if err == nil {
@@ -111,6 +114,7 @@ func TestRunServer_ScansConventionalDirsWithNoCLIDirs(t *testing.T) {
 	}
 }
 func TestRunCLI_MaxInstancesFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test.gguf")
 
@@ -135,6 +139,7 @@ func TestRunCLI_MaxInstancesFlag(t *testing.T) {
 	}
 }
 func TestRunCLI_SlotsFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test.gguf")
 

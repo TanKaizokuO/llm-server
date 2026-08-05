@@ -96,7 +96,13 @@ func runInspect(args []string, stdout io.Writer) error {
 }
 
 func runServer(parentCtx context.Context, addr, cachePath, configPath string, budget, idleTTL, rescanInterval time.Duration, maxInstances, slots int, dirs ...string) error {
-	scanDirs := append(supervisor.ConventionalModelDirs(), dirs...)
+	// CLI dirs come first: discoverModels keeps the first Model it sees for
+	// a given ID, so an operator's explicit directory wins over a
+	// conventional cache location on a duplicate.
+	conventional := supervisor.ConventionalModelDirs()
+	scanDirs := make([]string, 0, len(dirs)+len(conventional))
+	scanDirs = append(scanDirs, dirs...)
+	scanDirs = append(scanDirs, conventional...)
 
 	h := host.New()
 	sup, err := supervisor.NewWithOpts(h, scanDirs,

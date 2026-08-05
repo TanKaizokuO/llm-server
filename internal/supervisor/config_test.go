@@ -203,6 +203,82 @@ func TestConfig_InvalidTTLFailsStartup(t *testing.T) {
 	}
 }
 
+// TestConfig_PartialTunedOverrideFailsStartup ensures a pin missing either
+// field is rejected at load time rather than silently launching with the
+// other flag at its zero value (CPU-only offload, or an unusable
+// zero-length context) with no measurement left to correct it.
+func TestConfig_PartialTunedOverrideFailsStartup(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "partial-pin-model.gguf", "llama", "Q4_K_M")
+	configPath := writeTestConfig(t, tmpDir, "config.json", `{
+		"models": {
+			"partial-pin-model:q4_k_m": {"tuned": {"ctx_len": 4096}}
+		}
+	}`)
+
+	_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
+	if err == nil {
+		t.Fatal("expected NewWithOpts to fail on a tuned override missing offload, got nil")
+	}
+	if !strings.Contains(err.Error(), "tuned requires both ctx_len and offload") {
+		t.Errorf("error = %v, want containing 'tuned requires both ctx_len and offload'", err)
+	}
+}
+
+// TestConfig_ZeroCtxLenTunedOverrideFailsStartup ensures a pin cannot set an
+// unusable zero-length context, even when both fields are present.
+func TestConfig_ZeroCtxLenTunedOverrideFailsStartup(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "zero-ctx-model.gguf", "llama", "Q4_K_M")
+	configPath := writeTestConfig(t, tmpDir, "config.json", `{
+		"models": {
+			"zero-ctx-model:q4_k_m": {"tuned": {"ctx_len": 0, "offload": 10}}
+		}
+	}`)
+
+	_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
+	if err == nil {
+		t.Fatal("expected NewWithOpts to fail on a zero ctx_len pin, got nil")
+	}
+	if !strings.Contains(err.Error(), "ctx_len must be positive") {
+		t.Errorf("error = %v, want containing 'ctx_len must be positive'", err)
+	}
+}
+
+// TestConfig_TunedOverrideAllowsZeroOffload ensures a legitimate CPU-only
+// pin (offload explicitly 0, with both fields present) is accepted — only a
+// missing field or a zero context length is rejected.
+func TestConfig_TunedOverrideAllowsZeroOffload(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "cpu-only-model.gguf", "llama", "Q4_K_M")
+	configPath := writeTestConfig(t, tmpDir, "config.json", `{
+		"models": {
+			"cpu-only-model:q4_k_m": {"tuned": {"ctx_len": 2048, "offload": 0}}
+		}
+	}`)
+
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithConfigFile(configPath))
+	if err != nil {
+		t.Fatalf("NewWithOpts failed on a legitimate zero-offload pin: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	body := []byte(`{"model":"cpu-only-model:q4_k_m","messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200. body: %s", rr.Code, rr.Body.String())
+	}
+
+	launches := fakeHost.Launches()
+	if len(launches) != 1 {
+		t.Fatalf("launches = %d, want 1", len(launches))
+	}
+	assertArgvFlag(t, launches[0], "-ngl", "0")
+}
+
 // TestConfig_MissingFileFailsStartup ensures an explicitly configured but
 // unreadable config path is a startup error, distinct from the file simply
 // being absent by default (which is the documented zero-config path).

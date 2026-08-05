@@ -286,9 +286,15 @@ type tunedConfig struct {
 // TunedConfig pins a Model's launch flags verbatim, bypassing empirical
 // measurement entirely. It is never written to the Tuning cache file: it is
 // a static override supplied by the operator, re-applied on every launch.
+//
+// Both fields are required together: json.Unmarshal leaves a missing field
+// nil rather than zero, so loadConfig can reject a partial pin instead of
+// silently launching with the other flag at its zero value (CPU-only
+// offload, or an unusable zero-length context) with no measurement left to
+// correct it.
 type TunedConfig struct {
-	CtxLen  uint64 `json:"ctx_len"`
-	Offload uint64 `json:"offload"`
+	CtxLen  *uint64 `json:"ctx_len"`
+	Offload *uint64 `json:"offload"`
 }
 
 // ModelConfig specifies configuration overrides for a specific Model. Every
@@ -427,6 +433,7 @@ type Supervisor struct {
 	slotsPerInstance     int
 	configPath           string
 	config               Config
+	configTTL            map[string]time.Duration
 	dirs                 []string
 	rescanInterval       time.Duration
 	rescanStop           chan struct{}
@@ -596,40 +603,63 @@ func (s *Supervisor) loadConfig() error {
 		return fmt.Errorf("parsing config file %q: %w", s.configPath, err)
 	}
 
+	configTTL := make(map[string]time.Duration, len(cfg.Models))
 	for ref, mc := range cfg.Models {
 		if mc.TTL != "" {
-			if _, err := time.ParseDuration(mc.TTL); err != nil {
+			d, err := time.ParseDuration(mc.TTL)
+			if err != nil {
 				return fmt.Errorf("config file %q: model %q: invalid ttl %q: %w", s.configPath, ref, mc.TTL, err)
 			}
+			configTTL[ref] = d
 		}
 		if mc.Slots != nil && *mc.Slots <= 0 {
 			return fmt.Errorf("config file %q: model %q: slots must be positive, got %d", s.configPath, ref, *mc.Slots)
 		}
+		if mc.Tuned != nil && (mc.Tuned.CtxLen == nil || mc.Tuned.Offload == nil) {
+			return fmt.Errorf("config file %q: model %q: tuned requires both ctx_len and offload", s.configPath, ref)
+		}
+		if mc.Tuned != nil && *mc.Tuned.CtxLen == 0 {
+			return fmt.Errorf("config file %q: model %q: tuned ctx_len must be positive", s.configPath, ref)
+		}
 	}
 
 	s.config = cfg
+	s.configTTL = configTTL
 	return nil
 }
 
-// resolveModelConfig looks up m's configuration override, matching by ID,
-// then Name, then Path, then base filename — the same precedence
-// resolveTTLLocked already uses for runtime TTL overrides. s.config is
+// lookupByModelKeys checks m against ID, then Name, then Path, then base
+// filename, in that order — the precedence every config and runtime
+// override in this file uses, since an operator may key an override by
+// whichever form of a Model's identity they have on hand.
+func lookupByModelKeys[V any](m Model, byKey map[string]V) (V, bool) {
+	if v, ok := byKey[m.ID]; ok {
+		return v, true
+	}
+	if v, ok := byKey[m.Name]; ok {
+		return v, true
+	}
+	if v, ok := byKey[m.Path]; ok {
+		return v, true
+	}
+	if v, ok := byKey[filepath.Base(m.Path)]; ok {
+		return v, true
+	}
+	var zero V
+	return zero, false
+}
+
+// resolveModelConfig looks up m's configuration override. s.config is
 // populated once at startup and never mutated afterward, so this is safe
 // to call without holding s.mu.
 func (s *Supervisor) resolveModelConfig(m Model) (ModelConfig, bool) {
-	if mc, ok := s.config.Models[m.ID]; ok {
-		return mc, true
-	}
-	if mc, ok := s.config.Models[m.Name]; ok {
-		return mc, true
-	}
-	if mc, ok := s.config.Models[m.Path]; ok {
-		return mc, true
-	}
-	if mc, ok := s.config.Models[filepath.Base(m.Path)]; ok {
-		return mc, true
-	}
-	return ModelConfig{}, false
+	return lookupByModelKeys(m, s.config.Models)
+}
+
+// resolveConfigTTL returns m's configured TTL override, pre-parsed and
+// validated once by loadConfig rather than re-parsed on every call.
+func (s *Supervisor) resolveConfigTTL(m Model) (time.Duration, bool) {
+	return lookupByModelKeys(m, s.configTTL)
 }
 
 // resolveSlots returns m's configured Slot count, falling back to the
@@ -651,21 +681,31 @@ func (s *Supervisor) resolveArgv(m Model) []string {
 
 // resolveTunedOverride returns m's pinned Tuned configuration, if the
 // operator configured one. A pinned value bypasses measurement entirely and
-// is never written to the Tuning cache file.
-func (s *Supervisor) resolveTunedOverride(m Model) (TunedConfig, bool) {
+// is never written to the Tuning cache file. loadConfig already rejected
+// any config where Tuned is set but CtxLen or Offload is nil, so both
+// pointers are safe to dereference here.
+func (s *Supervisor) resolveTunedOverride(m Model) (tunedConfig, bool) {
 	if mc, ok := s.resolveModelConfig(m); ok && mc.Tuned != nil {
-		return *mc.Tuned, true
+		return tunedConfig{CtxLen: *mc.Tuned.CtxLen, Offload: *mc.Tuned.Offload}, true
 	}
-	return TunedConfig{}, false
+	return tunedConfig{}, false
 }
 
 // Rescan re-scans the Supervisor's configured directories for Models,
 // picking up newly added or removed GGUF files. It never restarts resident
 // Instances or requires a restart of the Supervisor itself.
+//
+// A scan that comes back empty after Models were already being served is
+// treated as a transient discovery failure (an unmounted drive, a network
+// share blip) rather than an instruction to stop serving everything: it is
+// logged and the existing Model list is left in place. Startup already
+// refuses to begin with zero Models, so an operator who genuinely empties
+// every scanned directory only sees that reflected after a restart.
 func (s *Supervisor) Rescan() error {
 	s.mu.RLock()
 	dirs := s.dirs
 	closed := s.closed
+	hadModels := len(s.modelsList) > 0
 	s.mu.RUnlock()
 	if closed {
 		return errors.New("supervisor is closed")
@@ -674,6 +714,11 @@ func (s *Supervisor) Rescan() error {
 	models, err := discoverModels(dirs)
 	if err != nil {
 		return err
+	}
+
+	if len(models) == 0 && hadModels {
+		slog.Warn("rescan found no models, keeping previous model list", "dirs", dirs)
+		return nil
 	}
 
 	modelMap := make(map[string]Model, len(models))
@@ -1093,19 +1138,11 @@ func (s *Supervisor) resolveTTLLocked(modelID string) time.Duration {
 		return ttl
 	}
 	if m, ok := s.models[modelID]; ok {
-		if ttl, ok := s.modelTTLs[m.Name]; ok {
+		if ttl, ok := lookupByModelKeys(m, s.modelTTLs); ok {
 			return ttl
 		}
-		if ttl, ok := s.modelTTLs[m.Path]; ok {
+		if ttl, ok := s.resolveConfigTTL(m); ok {
 			return ttl
-		}
-		if ttl, ok := s.modelTTLs[filepath.Base(m.Path)]; ok {
-			return ttl
-		}
-		if mc, ok := s.resolveModelConfig(m); ok && mc.TTL != "" {
-			if d, err := time.ParseDuration(mc.TTL); err == nil {
-				return d
-			}
 		}
 	}
 	return s.defaultTTL
@@ -1598,8 +1635,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 }
 
 func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
-	if tuned, ok := s.resolveTunedOverride(m); ok {
-		cfg := tunedConfig{CtxLen: tuned.CtxLen, Offload: tuned.Offload}
+	if cfg, ok := s.resolveTunedOverride(m); ok {
 		return s.launchConfig(loadCtx, m, cfg)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -92,8 +93,8 @@ func TestRescan_Timer(t *testing.T) {
 	}
 }
 
-// TestRescan_DisabledByDefaultInterval ensures a rescanInterval of 0 turns
-// off the background timer without breaking on-demand rescanning.
+// TestRescan_DisabledByZeroInterval ensures a rescanInterval of 0 turns off
+// the background timer, without breaking on-demand rescanning.
 func TestRescan_DisabledByZeroInterval(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "first-model.gguf", "llama", "Q4_K_M")
@@ -116,5 +117,38 @@ func TestRescan_DisabledByZeroInterval(t *testing.T) {
 	}
 	if ids := listedModelIDs(t, sup); len(ids) != 2 {
 		t.Fatalf("models after explicit Rescan = %v, want 2", ids)
+	}
+}
+
+// TestRescan_TransientEmptyScanKeepsPreviousModelList ensures a scan that
+// comes back empty after Models were already being served does not wipe
+// out the live Model list — discoverModels cannot distinguish "the
+// operator genuinely emptied the directory" from "a network mount blipped
+// for one scan", so Rescan conservatively keeps serving what it already
+// knew about until a restart.
+func TestRescan_TransientEmptyScanKeepsPreviousModelList(t *testing.T) {
+	tmpDir := t.TempDir()
+	modelPath := writeTestGGUF(t, tmpDir, "only-model.gguf", "llama", "Q4_K_M")
+
+	sup, err := supervisor.New(host.NewFakeHost(), tmpDir)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	if ids := listedModelIDs(t, sup); len(ids) != 1 {
+		t.Fatalf("initial models = %v, want 1", ids)
+	}
+
+	if err := os.Remove(modelPath); err != nil {
+		t.Fatalf("removing model file: %v", err)
+	}
+
+	if err := sup.Rescan(); err != nil {
+		t.Fatalf("Rescan failed: %v", err)
+	}
+
+	if ids := listedModelIDs(t, sup); len(ids) != 1 {
+		t.Fatalf("models after a scan finding nothing = %v, want the previous 1 preserved", ids)
 	}
 }
