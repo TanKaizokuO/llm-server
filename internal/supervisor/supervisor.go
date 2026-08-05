@@ -42,6 +42,7 @@ type residentInstance struct {
 	inst        host.Instance
 	ttl         time.Duration
 	activeCount int
+	maxSlots    int
 	draining    bool
 	stopped     bool
 	idleTimer   *time.Timer
@@ -51,15 +52,25 @@ type residentInstance struct {
 	idleCond    *sync.Cond
 }
 
-func newResidentInstance(modelID string, inst host.Instance, ttl time.Duration) *residentInstance {
+func newResidentInstance(modelID string, inst host.Instance, ttl time.Duration, maxSlots int) *residentInstance {
+	if maxSlots <= 0 {
+		maxSlots = 1
+	}
 	ri := &residentInstance{
 		modelID:  modelID,
 		inst:     inst,
 		ttl:      ttl,
+		maxSlots: maxSlots,
 		lastUsed: time.Now(),
 	}
 	ri.idleCond = sync.NewCond(&ri.mu)
 	return ri
+}
+
+func (ri *residentInstance) Occupancy() (active, max int) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	return ri.activeCount, ri.maxSlots
 }
 
 func (ri *residentInstance) getLastUsed() time.Time {
@@ -68,10 +79,60 @@ func (ri *residentInstance) getLastUsed() time.Time {
 	return ri.lastUsed
 }
 
-func (ri *residentInstance) acquire() bool {
+func (ri *residentInstance) acquire(ctx context.Context) bool {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 
+	if ctx.Err() != nil {
+		return false
+	}
+	if ri.draining || ri.stopped {
+		return false
+	}
+	select {
+	case <-ri.inst.Done():
+		return false
+	default:
+	}
+
+	if ri.maxSlots <= 0 {
+		ri.maxSlots = 1
+	}
+
+	if ri.activeCount >= ri.maxSlots {
+		stopCtxWait := make(chan struct{})
+		defer close(stopCtxWait)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				ri.mu.Lock()
+				ri.idleCond.Broadcast()
+				ri.mu.Unlock()
+			case <-stopCtxWait:
+			}
+		}()
+
+		for ri.activeCount >= ri.maxSlots {
+			if ctx.Err() != nil {
+				return false
+			}
+			if ri.draining || ri.stopped {
+				return false
+			}
+			select {
+			case <-ri.inst.Done():
+				return false
+			default:
+			}
+
+			ri.idleCond.Wait()
+		}
+	}
+
+	if ctx.Err() != nil {
+		return false
+	}
 	if ri.draining || ri.stopped {
 		return false
 	}
@@ -98,8 +159,8 @@ func (ri *residentInstance) release(s *Supervisor) {
 	if ri.activeCount > 0 {
 		ri.activeCount--
 	}
+	ri.idleCond.Broadcast()
 	if ri.activeCount == 0 {
-		ri.idleCond.Broadcast()
 		if ri.draining {
 			return
 		}
@@ -259,6 +320,22 @@ func WithMaxResidentInstances(n int) Option {
 	return WithMaxInstances(n)
 }
 
+// WithSlotsPerInstance sets the number of concurrent slots per resident instance.
+// A value <= 0 defaults to 1.
+func WithSlotsPerInstance(n int) Option {
+	return func(s *Supervisor) {
+		if n <= 0 {
+			n = 1
+		}
+		s.slotsPerInstance = n
+	}
+}
+
+// WithSlots is an alias for WithSlotsPerInstance.
+func WithSlots(n int) Option {
+	return WithSlotsPerInstance(n)
+}
+
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // the Instance registry, and the Tuning cache.
 type Supervisor struct {
@@ -280,6 +357,7 @@ type Supervisor struct {
 	defaultTTL           time.Duration
 	modelTTLs            map[string]time.Duration
 	maxInstances         int
+	slotsPerInstance     int
 	closed               bool
 }
 
@@ -315,18 +393,18 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 	defaultBudget := 2 * time.Minute
 
 	s := &Supervisor{
-		host:         h,
-		models:       modelMap,
-		modelsList:   models,
-		instances:    make(map[string]*residentInstance),
-		loading:      make(map[string]*pendingInstance),
-		tuned:        make(map[string]TuningEntry),
-		cachePath:    defaultCachePath,
-		tuningBudget: defaultBudget,
-		defaultTTL:   5 * time.Minute,
-		modelTTLs:    make(map[string]time.Duration),
+		host:             h,
+		models:           modelMap,
+		modelsList:       models,
+		instances:        make(map[string]*residentInstance),
+		loading:          make(map[string]*pendingInstance),
+		tuned:            make(map[string]TuningEntry),
+		cachePath:        defaultCachePath,
+		tuningBudget:     defaultBudget,
+		defaultTTL:       5 * time.Minute,
+		modelTTLs:        make(map[string]time.Duration),
+		slotsPerInstance: 1,
 	}
-
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -334,6 +412,25 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 	s.loadTuningCache()
 
 	return s, nil
+}
+
+// SlotsPerInstance returns the configured number of concurrent slots per resident instance.
+func (s *Supervisor) SlotsPerInstance() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.slotsPerInstance
+}
+
+// InstanceOccupancy returns the current active and total slot count for a resident instance, if loaded.
+func (s *Supervisor) InstanceOccupancy(modelID string) (active, max int, ok bool) {
+	s.mu.RLock()
+	resInst, exists := s.instances[modelID]
+	s.mu.RUnlock()
+	if !exists || resInst == nil {
+		return 0, 0, false
+	}
+	active, max = resInst.Occupancy()
+	return active, max, true
 }
 
 func (s *Supervisor) loadTuningCache() {
@@ -819,30 +916,90 @@ func (s *Supervisor) GetModelTTL(modelRef string) (time.Duration, error) {
 }
 
 func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Instance, func(), error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil, func() {}, errors.New("supervisor is closed")
-	}
-
-	if resInst, ok := s.instances[m.ID]; ok && resInst != nil {
-		select {
-		case <-resInst.inst.Done():
-			resInst.stopTimerAndMarkStopped()
-			delete(s.instances, m.ID)
-		default:
-			if resInst.acquire() {
-				s.mu.Unlock()
-				return resInst.inst, func() { resInst.release(s) }, nil
-			}
-			delete(s.instances, m.ID)
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return nil, func() {}, errors.New("supervisor is closed")
 		}
-	}
 
-	if req, ok := s.loading[m.ID]; ok {
-		req.mu.Lock()
-		req.callers++
-		req.mu.Unlock()
+		if resInst, ok := s.instances[m.ID]; ok && resInst != nil {
+			select {
+			case <-resInst.inst.Done():
+				resInst.stopTimerAndMarkStopped()
+				delete(s.instances, m.ID)
+			default:
+				s.mu.Unlock()
+				if resInst.acquire(ctx) {
+					return resInst.inst, func() { resInst.release(s) }, nil
+				}
+				if ctx.Err() != nil {
+					return nil, func() {}, ctx.Err()
+				}
+				s.mu.Lock()
+				if current, ok := s.instances[m.ID]; ok && current == resInst {
+					delete(s.instances, m.ID)
+				}
+				s.mu.Unlock()
+				continue
+			}
+		}
+
+		if req, ok := s.loading[m.ID]; ok {
+			req.mu.Lock()
+			req.callers++
+			req.mu.Unlock()
+			s.mu.Unlock()
+
+			doneMonitor := make(chan struct{})
+			defer close(doneMonitor)
+			go func() {
+				select {
+				case <-ctx.Done():
+					req.mu.Lock()
+					req.callers--
+					if req.callers == 0 && req.cancel != nil {
+						req.cancel()
+					}
+					req.mu.Unlock()
+				case <-req.ready:
+				case <-doneMonitor:
+				}
+			}()
+
+			select {
+			case <-req.ready:
+				if req.err != nil {
+					return nil, func() {}, req.err
+				}
+				s.mu.Lock()
+				resInst, ok := s.instances[m.ID]
+				s.mu.Unlock()
+				if ok && resInst != nil {
+					if resInst.acquire(ctx) {
+						return resInst.inst, func() { resInst.release(s) }, nil
+					}
+					if ctx.Err() != nil {
+						return nil, func() {}, ctx.Err()
+					}
+					continue
+				}
+				if req.inst != nil {
+					return req.inst, func() {}, nil
+				}
+				return nil, func() {}, errors.New("instance unavailable after load")
+			case <-ctx.Done():
+				return nil, func() {}, ctx.Err()
+			}
+		}
+
+		loadCtx, loadCancel := context.WithCancel(context.Background())
+		req := &pendingInstance{
+			ready:   make(chan struct{}),
+			cancel:  loadCancel,
+			callers: 1,
+		}
+		s.loading[m.ID] = req
 		s.mu.Unlock()
 
 		doneMonitor := make(chan struct{})
@@ -861,89 +1018,52 @@ func (s *Supervisor) getOrLaunchInstance(ctx context.Context, m Model) (host.Ins
 			}
 		}()
 
-		select {
-		case <-req.ready:
-			if req.err != nil {
-				return nil, func() {}, req.err
+		newInst, err := s.launchInstance(loadCtx, m)
+
+		s.mu.Lock()
+		delete(s.loading, m.ID)
+		req.inst = newInst
+		req.err = err
+
+		var instToStop host.Instance
+		var resInst *residentInstance
+		if err == nil {
+			if s.closed {
+				instToStop = newInst
+				req.inst = nil
+				req.err = errors.New("supervisor is closed")
+			} else {
+				if s.maxInstances > 0 && len(s.instances) >= s.maxInstances {
+					s.evictLRULocked()
+				}
+				ttl := s.resolveTTLLocked(m.ID)
+				resInst = newResidentInstance(m.ID, newInst, ttl, s.slotsPerInstance)
+				if !resInst.acquire(ctx) {
+					instToStop = newInst
+					req.inst = nil
+					if ctx.Err() != nil {
+						req.err = ctx.Err()
+					} else {
+						req.err = errors.New("instance unavailable after launch")
+					}
+				} else {
+					s.instances[m.ID] = resInst
+				}
 			}
-			s.mu.Lock()
-			resInst, ok := s.instances[m.ID]
-			if ok && resInst != nil && resInst.acquire() {
-				s.mu.Unlock()
-				return resInst.inst, func() { resInst.release(s) }, nil
-			}
-			s.mu.Unlock()
-			if req.inst != nil {
-				return req.inst, func() {}, nil
-			}
-			return nil, func() {}, errors.New("instance unavailable after load")
-		case <-ctx.Done():
-			return nil, func() {}, ctx.Err()
 		}
-	}
+		close(req.ready)
+		s.mu.Unlock()
 
-	loadCtx, loadCancel := context.WithCancel(context.Background())
-	req := &pendingInstance{
-		ready:   make(chan struct{}),
-		cancel:  loadCancel,
-		callers: 1,
-	}
-	s.loading[m.ID] = req
-	s.mu.Unlock()
-
-	doneMonitor := make(chan struct{})
-	defer close(doneMonitor)
-	go func() {
-		select {
-		case <-ctx.Done():
-			req.mu.Lock()
-			req.callers--
-			if req.callers == 0 && req.cancel != nil {
-				req.cancel()
-			}
-			req.mu.Unlock()
-		case <-req.ready:
-		case <-doneMonitor:
+		if instToStop != nil {
+			_ = stopInstance(context.Background(), instToStop, 5*time.Second)
 		}
-	}()
 
-	newInst, err := s.launchInstance(loadCtx, m)
-
-	s.mu.Lock()
-	delete(s.loading, m.ID)
-	req.inst = newInst
-	req.err = err
-
-	var instToStop host.Instance
-	var resInst *residentInstance
-	if err == nil {
-		if s.closed {
-			instToStop = newInst
-			req.inst = nil
-			req.err = errors.New("supervisor is closed")
-		} else {
-			if s.maxInstances > 0 && len(s.instances) >= s.maxInstances {
-				s.evictLRULocked()
-			}
-			ttl := s.resolveTTLLocked(m.ID)
-			resInst = newResidentInstance(m.ID, newInst, ttl)
-			_ = resInst.acquire()
-			s.instances[m.ID] = resInst
+		if req.err != nil {
+			return nil, func() {}, req.err
 		}
+		return resInst.inst, func() { resInst.release(s) }, nil
 	}
-	close(req.ready)
-	s.mu.Unlock()
-
-	if instToStop != nil {
-		_ = stopInstance(context.Background(), instToStop, 5*time.Second)
-	}
-
-	if req.err != nil {
-		return nil, func() {}, req.err
-	}
-	return resInst.inst, func() { resInst.release(s) }, nil
 }
-
 func (s *Supervisor) evictLRULocked() {
 	var lruID string
 	var lruInst *residentInstance
@@ -992,7 +1112,7 @@ func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunedCon
 		"-m", m.Path,
 		"-c", strconv.FormatUint(cfg.CtxLen, 10),
 		"-ngl", strconv.FormatUint(cfg.Offload, 10),
-		"-np", "1",
+		"-np", strconv.Itoa(s.slotsPerInstance),
 	}
 
 	newInst, err := s.host.Launch(loadCtx, argv)

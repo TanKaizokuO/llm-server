@@ -44,6 +44,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 	budget := fs.Duration("tuning-budget", 2*time.Minute, "maximum duration allowed for a single tuning run")
 	idleTTL := fs.Duration("idle-ttl", 5*time.Minute, "default idle TTL for resident instances")
 	maxInstances := fs.Int("max-instances", 0, "maximum number of resident instances allowed (0 = uncapped)")
+	slots := fs.Int("slots", 1, "number of concurrent slots per instance")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -51,7 +52,7 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr, *cachePath, *budget, *idleTTL, *maxInstances, fs.Args()...)
+	return runServer(parentCtx, *addr, *cachePath, *budget, *idleTTL, *maxInstances, *slots, fs.Args()...)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -92,7 +93,7 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr string, cachePath string, budget time.Duration, idleTTL time.Duration, maxInstances int, dirs ...string) error {
+func runServer(parentCtx context.Context, addr string, cachePath string, budget time.Duration, idleTTL time.Duration, maxInstances int, slots int, dirs ...string) error {
 	if len(dirs) == 0 {
 		dirs = []string{"."}
 	}
@@ -102,6 +103,7 @@ func runServer(parentCtx context.Context, addr string, cachePath string, budget 
 		supervisor.WithTuningBudget(budget),
 		supervisor.WithDefaultTTL(idleTTL),
 		supervisor.WithMaxInstances(maxInstances),
+		supervisor.WithSlotsPerInstance(slots),
 	)
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)

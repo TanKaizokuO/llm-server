@@ -34,7 +34,7 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, tmpDir)
+		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, tmpDir)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -58,7 +58,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
-	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, tmpDir)
+	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, tmpDir)
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
 	}
@@ -66,7 +66,7 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 
 func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
 	emptyDir := t.TempDir()
-	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, emptyDir)
+	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), 2*time.Minute, 5*time.Minute, 0, 1, emptyDir)
 	if err == nil {
 		t.Fatal("expected error when no models found, got nil")
 	}
@@ -84,6 +84,30 @@ func TestRunCLI_MaxInstancesFlag(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runCLI(ctx, []string{"llm-server", "-addr", "127.0.0.1:0", "-max-instances", "2", tmpDir}, os.Stdout)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("runCLI returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runCLI did not exit after context cancelation")
+	}
+}
+func TestRunCLI_SlotsFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	createTestModelFile(t, tmpDir, "test.gguf")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runCLI(ctx, []string{"llm-server", "-addr", "127.0.0.1:0", "-slots", "4", tmpDir}, os.Stdout)
 	}()
 
 	time.Sleep(50 * time.Millisecond)

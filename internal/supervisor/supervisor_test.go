@@ -1431,3 +1431,245 @@ func TestMaxInstances_ZeroOrUncappedAllowsMultiple(t *testing.T) {
 		}
 	}
 }
+func TestSlots_ConfigurableAndPassedToChild(t *testing.T) {
+	tmpDir := t.TempDir()
+	modelPath := writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf")
+
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithSlots(4),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	if sup.SlotsPerInstance() != 4 {
+		t.Fatalf("sup.SlotsPerInstance() = %d, want 4", sup.SlotsPerInstance())
+	}
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	body := `{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	resp.Body.Close()
+
+	launches := fakeHost.Launches()
+	if len(launches) == 0 {
+		t.Fatal("expected at least 1 launch, got 0")
+	}
+
+	wantArgv := []string{"llama-server", "-m", modelPath, "-c", "4096", "-ngl", "0", "-np", "4"}
+	gotArgv := launches[0]
+	if strings.Join(gotArgv, " ") != strings.Join(wantArgv, " ") {
+		t.Errorf("launched argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+func TestSlots_OccupancyTrackedAndWaitsWhenSlotsBusy(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf")
+
+	slowHandlerRelease := make(chan struct{})
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-slowHandlerRelease:
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"choices":[]}`))
+			case <-r.Context().Done():
+			}
+		}), nil
+	})
+
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithSlots(1),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// Launch Request 1 in background
+	req1Done := make(chan error, 1)
+	go func() {
+		body := `{"model":"model-a","messages":[{"role":"user","content":"req1"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			req1Done <- err
+			return
+		}
+		resp.Body.Close()
+		req1Done <- nil
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Launch Request 2 in background while Request 1 holds the slot
+	req2Done := make(chan error, 1)
+	go func() {
+		body := `{"model":"model-a","messages":[{"role":"user","content":"req2"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			req2Done <- err
+			return
+		}
+		resp.Body.Close()
+		req2Done <- nil
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify Request 2 is still waiting, Request 1 hasn't finished, and occupancy is 1/1
+	select {
+	case err := <-req2Done:
+		t.Fatalf("Request 2 finished prematurely: %v", err)
+	default:
+		// OK, Request 2 is queued waiting for a slot
+	}
+
+	active, max, ok := sup.InstanceOccupancy("model-a:q4_k_m")
+	if !ok || active != 1 || max != 1 {
+		t.Fatalf("expected occupancy 1/1 while busy, got %d/%d (ok=%v)", active, max, ok)
+	}
+
+	// Release slow handler so Request 1 finishes and Request 2 acquires slot
+	close(slowHandlerRelease)
+
+	select {
+	case err := <-req1Done:
+		if err != nil {
+			t.Errorf("Request 1 failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Request 1 timed out")
+	}
+
+	select {
+	case err := <-req2Done:
+		if err != nil {
+			t.Errorf("Request 2 failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Request 2 timed out waiting for slot")
+	}
+	active, max, ok = sup.InstanceOccupancy("model-a:q4_k_m")
+	if !ok || active != 0 || max != 1 {
+		t.Fatalf("expected final occupancy 0/1, got %d/%d (ok=%v)", active, max, ok)
+	}
+}
+
+func TestSlots_CancellingRequestFreesSlotPromptly(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf")
+
+	req1Release := make(chan struct{})
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-req1Release:
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"choices":[]}`))
+			case <-r.Context().Done():
+			}
+		}), nil
+	})
+
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
+		supervisor.WithSlots(1),
+	)
+	if err != nil {
+		t.Fatalf("supervisor.NewWithOpts: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// Launch Request 1 (holds slot 1)
+	req1Done := make(chan error, 1)
+	go func() {
+		body := `{"model":"model-a","messages":[{"role":"user","content":"req1"}]}`
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			req1Done <- err
+			return
+		}
+		resp.Body.Close()
+		req1Done <- nil
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Launch Request 2 with cancellable context while Request 1 holds slot
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	req2Done := make(chan error, 1)
+	go func() {
+		body := `{"model":"model-a","messages":[{"role":"user","content":"req2"}]}`
+		req, _ := http.NewRequestWithContext(ctx2, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			req2Done <- err
+			return
+		}
+		resp.Body.Close()
+		req2Done <- nil
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel2()
+
+	select {
+	case err := <-req2Done:
+		if err == nil {
+			t.Fatal("expected Request 2 to fail due to context cancellation, got nil error")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Request 2 did not cancel promptly while waiting for slot")
+	}
+	// Verify Request 1 is still holding slot (active = 1, max = 1)
+	active, max, ok := sup.InstanceOccupancy("model-a:q4_k_m")
+	if !ok || active != 1 || max != 1 {
+		t.Fatalf("expected occupancy 1/1, got %d/%d (ok=%v)", active, max, ok)
+	}
+
+	// Release Request 1
+	close(req1Release)
+	select {
+	case err := <-req1Done:
+		if err != nil {
+			t.Errorf("Request 1 failed: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Request 1 timed out")
+	}
+
+	// Issue Request 3 to confirm the slot is available and works
+	body3 := `{"model":"model-a","messages":[{"role":"user","content":"req3"}]}`
+	resp3, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body3))
+	if err != nil {
+		t.Fatalf("Request 3 failed to acquire slot: %v", err)
+	}
+	resp3.Body.Close()
+
+	active, max, ok = sup.InstanceOccupancy("model-a:q4_k_m")
+	if !ok || active != 0 || max != 1 {
+		t.Fatalf("expected final occupancy 0/1, got %d/%d (ok=%v)", active, max, ok)
+	}
+}
