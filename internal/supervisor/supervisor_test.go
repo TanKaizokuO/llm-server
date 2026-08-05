@@ -441,6 +441,7 @@ func TestV1ChatCompletions_RequestCancellationPropagatesToInstance(t *testing.T)
 		t.Fatal("timed out waiting for instance context cancellation")
 	}
 }
+
 func TestModelResolution_ExactNameTagResolvesWhenMultipleQuantisationsExist(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")

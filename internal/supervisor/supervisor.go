@@ -285,7 +285,10 @@ func (s *Supervisor) handleV1ChatCompletions(w http.ResponseWriter, r *http.Requ
 		case errors.As(err, &notFound):
 			writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", notFound.Ref), "model", "model_not_found")
 		case errors.As(err, &ambiguous):
-			writeOpenAIError(w, http.StatusBadRequest, ambiguous.Error(), "model", "model_ambiguous")
+			msg := fmt.Sprintf("model '%s' is ambiguous; available tags: %s", ambiguous.Name, strings.Join(ambiguous.Tags, ", "))
+			writeOpenAIError(w, http.StatusBadRequest, msg, "model", "model_ambiguous")
+		default:
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "", "internal_error")
 		}
 		return
 	}
