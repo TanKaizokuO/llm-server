@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -328,7 +329,7 @@ func TestOllama_WireFormatFixtures(t *testing.T) {
 	srv, _ := newTestServer(t)
 	defer srv.Close()
 
-	// Assert Chat Streaming Wire Format against expected JSON schema keys
+	// 1. Chat streaming framing & terminal statistics schema assertion
 	chatReq := `{"model":"llama-3-8b:q4_k_m","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	resp, err := http.Post(srv.URL+"/api/chat", "application/json", strings.NewReader(chatReq))
 	if err != nil {
@@ -339,27 +340,99 @@ func TestOllama_WireFormatFixtures(t *testing.T) {
 	buf := new(bytes.Buffer)
 	_, _ = buf.ReadFrom(resp.Body)
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-
-	if len(lines) == 0 {
-		t.Fatal("empty response")
+	if len(lines) < 2 {
+		t.Fatalf("chat stream returned %d lines, want >= 2", len(lines))
 	}
 
-	// Verify terminal chunk keys match Ollama wire format specification exactly
-	lastLine := lines[len(lines)-1]
-	var rawKeys map[string]any
-	if err := json.Unmarshal([]byte(lastLine), &rawKeys); err != nil {
-		t.Fatalf("unmarshal terminal payload: %v", err)
+	// Verify intermediate NDJSON chunk structure
+	var interChunk map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &interChunk); err != nil {
+		t.Fatalf("unmarshal intermediate chat chunk: %v", err)
+	}
+	for _, forbidden := range []string{"total_duration", "done_reason", "eval_count"} {
+		if _, ok := interChunk[forbidden]; ok {
+			t.Errorf("intermediate chunk unexpected key %q", forbidden)
+		}
 	}
 
-	expectedKeys := []string{
-		"model", "created_at", "message", "done", "done_reason",
-		"total_duration", "load_duration", "prompt_eval_count",
-		"prompt_eval_duration", "eval_count", "eval_duration",
+	// Read recorded terminal fixture
+	fixtureData, err := os.ReadFile("testdata/ollama_chat_stream.ndjson")
+	if err != nil {
+		t.Fatalf("read testdata/ollama_chat_stream.ndjson: %v", err)
+	}
+	fixtureLines := strings.Split(strings.TrimSpace(string(fixtureData)), "\n")
+	var expectedTerminal map[string]any
+	_ = json.Unmarshal([]byte(fixtureLines[len(fixtureLines)-1]), &expectedTerminal)
+
+	var actualTerminal map[string]any
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &actualTerminal); err != nil {
+		t.Fatalf("unmarshal actual terminal chunk: %v", err)
 	}
 
-	for _, key := range expectedKeys {
-		if _, ok := rawKeys[key]; !ok {
-			t.Errorf("missing key %q in terminal Ollama payload fixture: %s", key, lastLine)
+	for key := range expectedTerminal {
+		if _, ok := actualTerminal[key]; !ok {
+			t.Errorf("terminal chat response missing key %q present in recorded fixture", key)
+		}
+	}
+
+	// 2. Generate streaming wire format
+	genReq := `{"model":"llama-3-8b:q4_k_m","prompt":"Hello","stream":true}`
+	respGen, err := http.Post(srv.URL+"/api/generate", "application/json", strings.NewReader(genReq))
+	if err != nil {
+		t.Fatalf("POST /api/generate: %v", err)
+	}
+	defer respGen.Body.Close()
+
+	bufGen := new(bytes.Buffer)
+	_, _ = bufGen.ReadFrom(respGen.Body)
+	genLines := strings.Split(strings.TrimSpace(bufGen.String()), "\n")
+	if len(genLines) < 2 {
+		t.Fatalf("generate stream returned %d lines, want >= 2", len(genLines))
+	}
+
+	var interGen map[string]any
+	if err := json.Unmarshal([]byte(genLines[0]), &interGen); err != nil {
+		t.Fatalf("unmarshal intermediate generate chunk: %v", err)
+	}
+	if _, ok := interGen["response"]; !ok {
+		t.Error("intermediate generate chunk missing 'response' key")
+	}
+}
+
+func TestOllama_KeepAliveZeroUnloadsImmediately(t *testing.T) {
+	fakeHost := host.NewFakeHost()
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
+
+	sup, err := supervisor.New(fakeHost, tmpDir)
+	if err != nil {
+		t.Fatalf("supervisor.New: %v", err)
+	}
+	defer sup.Close()
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	// Send keep_alive: 0
+	reqBody := `{"model":"llama-3-8b:q4_k_m","messages":[{"role":"user","content":"Hi"}],"keep_alive":0}`
+	resp, err := http.Post(srv.URL+"/api/chat", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("POST /api/chat: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Wait briefly for drain & unload goroutine to complete
+	insts := fakeHost.Instances()
+	if len(insts) > 0 {
+		select {
+		case <-insts[0].Done():
+			// OK, instance unloaded immediately after request
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected instance to unload immediately after keep_alive=0 request, but it remained running")
 		}
 	}
 }

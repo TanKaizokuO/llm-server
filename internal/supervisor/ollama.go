@@ -220,7 +220,7 @@ func (s *Supervisor) serveOllamaCompletion(
 		return
 	}
 
-	if ttl, ok := parseKeepAlive(rawKeepAlive); ok {
+	if ttl, ok := parseKeepAlive(rawKeepAlive); ok && ttl != 0 {
 		_ = s.SetModelTTL(model.ID, ttl)
 	}
 
@@ -240,6 +240,16 @@ func (s *Supervisor) serveOllamaCompletion(
 	defer release()
 	loadDuration := time.Since(loadStart)
 
+	if ttl, ok := parseKeepAlive(rawKeepAlive); ok && ttl == 0 {
+		s.mu.Lock()
+		resInst := s.instances[model.ID]
+		s.mu.Unlock()
+		if resInst != nil {
+			defer func() {
+				go resInst.drainAndStop(s, "keep_alive=0")
+			}()
+		}
+	}
 	openAIMessages := make([]map[string]string, len(messages))
 	for i, m := range messages {
 		openAIMessages[i] = map[string]string{
@@ -249,18 +259,21 @@ func (s *Supervisor) serveOllamaCompletion(
 	}
 
 	openAIReq := map[string]any{
-		"model":    model.ID,
-		"messages": openAIMessages,
-		"stream":   true,
+		"model":          model.ID,
+		"messages":       openAIMessages,
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
 	}
-
 	if len(rawOptions) > 0 {
 		var opts map[string]any
 		if err := json.Unmarshal(rawOptions, &opts); err == nil {
 			for k, v := range opts {
-				if k == "num_predict" {
+				switch k {
+				case "model", "messages", "stream", "stream_options":
+					// ignore option keys that shadow core parameters
+				case "num_predict":
 					openAIReq["max_tokens"] = v
-				} else {
+				default:
 					openAIReq[k] = v
 				}
 			}
@@ -309,12 +322,16 @@ func (s *Supervisor) serveOllamaCompletion(
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
 	}
-
 	scanner := bufio.NewScanner(resp.Body)
+	const maxTokenSize = 10 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxTokenSize)
 	var fullContent strings.Builder
 	var finishReason string
 	var evalCount int
 	var promptEvalCount int
+	var firstTokenReceived bool
+	var promptEvalDuration time.Duration
+	var evalDuration time.Duration
 	evalStart := time.Now()
 
 	for scanner.Scan() {
@@ -352,27 +369,31 @@ func (s *Supervisor) serveOllamaCompletion(
 
 		contentChunk := choice.Delta.Content
 		if contentChunk != "" {
+			if !firstTokenReceived {
+				firstTokenReceived = true
+				promptEvalDuration = time.Since(startTime)
+				evalStart = time.Now()
+			}
 			if chunk.Usage == nil {
 				evalCount++
 			}
 			if stream {
-				var lineBytes []byte
+				enc := json.NewEncoder(w)
 				if isChat {
-					lineBytes, _ = json.Marshal(ollamaChatIntermediateChunk{
+					_ = enc.Encode(ollamaChatIntermediateChunk{
 						Model:     modelRef,
 						CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 						Message:   ollamaMessage{Role: "assistant", Content: contentChunk},
 						Done:      false,
 					})
 				} else {
-					lineBytes, _ = json.Marshal(ollamaGenerateIntermediateChunk{
+					_ = enc.Encode(ollamaGenerateIntermediateChunk{
 						Model:     modelRef,
 						CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 						Response:  contentChunk,
 						Done:      false,
 					})
 				}
-				_, _ = w.Write(append(lineBytes, '\n'))
 				flusher.Flush()
 			} else {
 				fullContent.WriteString(contentChunk)
@@ -380,16 +401,26 @@ func (s *Supervisor) serveOllamaCompletion(
 		}
 	}
 
+	if err := scanner.Err(); err != nil && !stream {
+		writeOllamaError(w, http.StatusInternalServerError, fmt.Sprintf("stream scanner error: %v", err))
+		return
+	}
+
 	totalDuration := time.Since(startTime)
-	evalDuration := time.Since(evalStart)
+	if firstTokenReceived {
+		evalDuration = time.Since(evalStart)
+	} else {
+		promptEvalDuration = totalDuration
+		evalDuration = 0
+	}
 	if finishReason == "" {
 		finishReason = "stop"
 	}
 
 	if stream {
-		var finalBytes []byte
+		enc := json.NewEncoder(w)
 		if isChat {
-			finalBytes, _ = json.Marshal(ollamaChatFinalChunk{
+			_ = enc.Encode(ollamaChatFinalChunk{
 				Model:              modelRef,
 				CreatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 				Message:            ollamaMessage{Role: "assistant", Content: ""},
@@ -398,12 +429,12 @@ func (s *Supervisor) serveOllamaCompletion(
 				TotalDuration:      totalDuration.Nanoseconds(),
 				LoadDuration:       loadDuration.Nanoseconds(),
 				PromptEvalCount:    promptEvalCount,
-				PromptEvalDuration: (1 * time.Millisecond).Nanoseconds(),
+				PromptEvalDuration: promptEvalDuration.Nanoseconds(),
 				EvalCount:          evalCount,
 				EvalDuration:       evalDuration.Nanoseconds(),
 			})
 		} else {
-			finalBytes, _ = json.Marshal(ollamaGenerateFinalChunk{
+			_ = enc.Encode(ollamaGenerateFinalChunk{
 				Model:              modelRef,
 				CreatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 				Response:           "",
@@ -412,12 +443,11 @@ func (s *Supervisor) serveOllamaCompletion(
 				TotalDuration:      totalDuration.Nanoseconds(),
 				LoadDuration:       loadDuration.Nanoseconds(),
 				PromptEvalCount:    promptEvalCount,
-				PromptEvalDuration: (1 * time.Millisecond).Nanoseconds(),
+				PromptEvalDuration: promptEvalDuration.Nanoseconds(),
 				EvalCount:          evalCount,
 				EvalDuration:       evalDuration.Nanoseconds(),
 			})
 		}
-		_, _ = w.Write(append(finalBytes, '\n'))
 		flusher.Flush()
 	} else {
 		w.Header().Set("Content-Type", "application/json")
@@ -432,7 +462,7 @@ func (s *Supervisor) serveOllamaCompletion(
 				TotalDuration:      totalDuration.Nanoseconds(),
 				LoadDuration:       loadDuration.Nanoseconds(),
 				PromptEvalCount:    promptEvalCount,
-				PromptEvalDuration: (1 * time.Millisecond).Nanoseconds(),
+				PromptEvalDuration: promptEvalDuration.Nanoseconds(),
 				EvalCount:          evalCount,
 				EvalDuration:       evalDuration.Nanoseconds(),
 			})
@@ -446,7 +476,7 @@ func (s *Supervisor) serveOllamaCompletion(
 				TotalDuration:      totalDuration.Nanoseconds(),
 				LoadDuration:       loadDuration.Nanoseconds(),
 				PromptEvalCount:    promptEvalCount,
-				PromptEvalDuration: (1 * time.Millisecond).Nanoseconds(),
+				PromptEvalDuration: promptEvalDuration.Nanoseconds(),
 				EvalCount:          evalCount,
 				EvalDuration:       evalDuration.Nanoseconds(),
 			})
