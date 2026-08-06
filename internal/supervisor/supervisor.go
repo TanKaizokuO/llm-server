@@ -458,6 +458,9 @@ type Supervisor struct {
 	rescanInterval       time.Duration
 	rescanStop           chan struct{}
 	rescanStopOnce       sync.Once
+	rescanCtx            context.Context
+	rescanCancel         context.CancelFunc
+	rescanWG             sync.WaitGroup
 	closed               bool
 }
 
@@ -473,7 +476,7 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 	if h == nil {
 		h = host.New()
 	}
-	models, err := discoverModels(dirs)
+	models, err := discoverModels(context.Background(), dirs)
 	if err != nil {
 		return nil, err
 	}
@@ -508,6 +511,7 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 		rescanInterval:   30 * time.Second,
 		rescanStop:       make(chan struct{}),
 	}
+	s.rescanCtx, s.rescanCancel = context.WithCancel(context.Background())
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -718,11 +722,10 @@ func (s *Supervisor) resolveTunedOverride(m Model) (tunedConfig, bool) {
 	}
 	return tunedConfig{}, false
 }
-
 // Rescan re-scans the Supervisor's configured directories for Models,
 // picking up newly added or removed GGUF files. It never restarts resident
 // Instances or requires a restart of the Supervisor itself.
-func (s *Supervisor) Rescan() error {
+func (s *Supervisor) Rescan(ctx context.Context) error {
 	s.mu.RLock()
 	dirs := s.dirs
 	closed := s.closed
@@ -732,11 +735,10 @@ func (s *Supervisor) Rescan() error {
 		return errors.New("supervisor is closed")
 	}
 
-	models, err := discoverModels(dirs)
+	models, err := discoverModels(ctx, dirs)
 	if err != nil {
 		return err
 	}
-
 
 	modelMap := make(map[string]Model, len(models))
 	for _, m := range models {
@@ -745,6 +747,10 @@ func (s *Supervisor) Rescan() error {
 
 	var orphaned []string
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("supervisor is closed")
+	}
 	if hadModels {
 		for id := range s.models {
 			if _, ok := modelMap[id]; !ok {
@@ -766,13 +772,18 @@ func (s *Supervisor) Rescan() error {
 // startRescanTimer launches the background goroutine that calls Rescan on
 // s.rescanInterval, until Close stops it.
 func (s *Supervisor) startRescanTimer() {
+	if s.rescanInterval == 0 {
+		return
+	}
 	ticker := time.NewTicker(s.rescanInterval)
+	s.rescanWG.Add(1)
 	go func() {
+		defer s.rescanWG.Done()
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := s.Rescan(); err != nil {
+				if err := s.Rescan(s.rescanCtx); err != nil {
 					slog.Warn("periodic rescan failed", "err", err)
 				}
 			case <-s.rescanStop:
@@ -785,7 +796,10 @@ func (s *Supervisor) startRescanTimer() {
 // stopRescanTimer signals the background rescan goroutine to exit. Safe to
 // call multiple times or when no timer was started.
 func (s *Supervisor) stopRescanTimer() {
-	s.rescanStopOnce.Do(func() { close(s.rescanStop) })
+	s.rescanStopOnce.Do(func() {
+		close(s.rescanStop)
+		s.rescanCancel()
+	})
 }
 
 // Handler returns the Supervisor's HTTP router. This is the single router the
@@ -807,12 +821,10 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/embeddings", s.handleV1OpenAIProxy)
 	mux.HandleFunc("GET /v1/tuning", s.handleV1TuningGet)
 	mux.HandleFunc("POST /v1/tuning/reset", s.handleV1TuningReset)
-	mux.HandleFunc("DELETE /v1/tuning", s.handleV1TuningReset)
-	mux.HandleFunc("GET /api/tuning", s.handleV1TuningGet)
-	mux.HandleFunc("POST /api/tuning/reset", s.handleV1TuningReset)
-	mux.HandleFunc("DELETE /api/tuning", s.handleV1TuningReset)
 	mux.HandleFunc("POST /v1/rescan", s.handleV1Rescan)
 	mux.HandleFunc("POST /api/rescan", s.handleV1Rescan)
+	mux.HandleFunc("POST /api/tuning/reset", s.handleV1TuningReset)
+	mux.HandleFunc("DELETE /api/tuning", s.handleV1TuningReset)
 	return mux
 }
 // It returns nil if no Instance was resident for the model.
@@ -889,6 +901,18 @@ func (s *Supervisor) Close() error {
 	s.mu.Unlock()
 
 	var errs []error
+	
+	rescanWait := make(chan struct{})
+	go func() {
+		s.rescanWG.Wait()
+		close(rescanWait)
+	}()
+	select {
+	case <-rescanWait:
+	case <-time.After(10 * time.Second):
+		errs = append(errs, errors.New("timed out waiting for rescan goroutine to exit"))
+	}
+
 	for _, inst := range instancesToStop {
 		if err := stopInstance(context.Background(), inst, 10*time.Second); err != nil {
 			errs = append(errs, fmt.Errorf("stopping instance: %w", err))
@@ -1784,12 +1808,10 @@ func (s *Supervisor) handleV1TuningReset(w http.ResponseWriter, r *http.Request)
 
 	s.evictAllResidentInstances()
 
-	s.mu.Lock()
+	s.tuningMu.Lock()
 	s.tuned = make(map[string]TuningEntry)
-	if s.cachePath != "" {
-		_ = os.Remove(s.cachePath)
-	}
-	s.mu.Unlock()
+	_ = os.Remove(s.cachePath)
+	s.tuningMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
@@ -1807,7 +1829,7 @@ type rescanResponse struct {
 // configured directories, so a newly dropped GGUF becomes servable without
 // a restart.
 func (s *Supervisor) handleV1Rescan(w http.ResponseWriter, r *http.Request) {
-	if err := s.Rescan(); err != nil {
+	if err := s.Rescan(r.Context()); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error", "message": err.Error()})
 		return
 	}

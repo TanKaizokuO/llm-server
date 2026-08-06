@@ -2,7 +2,9 @@ package supervisor
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -72,7 +74,7 @@ func ConventionalModelDirs() []string {
 
 // discoverModels recursively scans the given directories for valid GGUF models.
 // It skips projectors, corrupt/unparseable files, and non-first shards.
-func discoverModels(dirs []string) ([]Model, error) {
+func discoverModels(ctx context.Context, dirs []string) ([]Model, error) {
 	discovered := make(map[string]Model)
 
 	for _, dir := range dirs {
@@ -87,8 +89,14 @@ func discoverModels(dirs []string) ([]Model, error) {
 
 		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
 				slog.Warn("failed to access path during model scan", "path", path, "err", err)
 				return nil
+			}
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			if d.IsDir() {
 				return nil

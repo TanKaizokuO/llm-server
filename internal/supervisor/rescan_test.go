@@ -2,6 +2,7 @@ package supervisor_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -113,7 +114,7 @@ func TestRescan_DisabledByZeroInterval(t *testing.T) {
 		t.Fatalf("models with timer disabled = %v, want 1 (no periodic rescan should have run)", ids)
 	}
 
-	if err := sup.Rescan(); err != nil {
+	if err := sup.Rescan(context.Background()); err != nil {
 		t.Fatalf("Rescan failed: %v", err)
 	}
 	if ids := listedModelIDs(t, sup); len(ids) != 2 {
@@ -160,7 +161,7 @@ func TestRescan_DeletedModelEvictsInstance(t *testing.T) {
 	}
 
 	// Rescan should discover the file is gone, remove the model, and evict the instance
-	if err := sup.Rescan(); err != nil {
+	if err := sup.Rescan(context.Background()); err != nil {
 		t.Fatalf("Rescan failed: %v", err)
 	}
 
@@ -199,7 +200,7 @@ func TestRescan_StartsWithNoModels_OnDemand(t *testing.T) {
 
 	writeTestGGUF(t, tmpDir, "new-model.gguf", "llama", "Q4_K_M")
 
-	if err := sup.Rescan(); err != nil {
+	if err := sup.Rescan(context.Background()); err != nil {
 		t.Fatalf("Rescan failed: %v", err)
 	}
 
