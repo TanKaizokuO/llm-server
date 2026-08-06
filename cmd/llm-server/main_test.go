@@ -36,7 +36,17 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), "127.0.0.1:0", filepath.Join(tmpDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, tmpDir)
+		errCh <- runServer(context.Background(), serverOptions{
+			Addr:           "127.0.0.1:0",
+			CachePath:      filepath.Join(tmpDir, "tuning.json"),
+			ConfigPath:     "",
+			Budget:         2 * time.Minute,
+			IdleTTL:        5 * time.Minute,
+			RescanInterval: 0,
+			MaxInstances:   0,
+			Slots:          1,
+			Dirs:           []string{tmpDir},
+		})
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -61,7 +71,17 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
-	err := runServer(context.Background(), "invalid-address-format:99999999", filepath.Join(tmpDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, tmpDir)
+	err := runServer(context.Background(), serverOptions{
+		Addr:           "invalid-address-format:99999999",
+		CachePath:      filepath.Join(tmpDir, "tuning.json"),
+		ConfigPath:     "",
+		Budget:         2 * time.Minute,
+		IdleTTL:        5 * time.Minute,
+		RescanInterval: 0,
+		MaxInstances:   0,
+		Slots:          1,
+		Dirs:           []string{tmpDir},
+	})
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
 	}
@@ -76,7 +96,17 @@ func TestRunServer_StartsWithNoModels(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(ctx, "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, emptyDir)
+		errCh <- runServer(ctx, serverOptions{
+			Addr:           "127.0.0.1:0",
+			CachePath:      filepath.Join(emptyDir, "tuning.json"),
+			ConfigPath:     "",
+			Budget:         2 * time.Minute,
+			IdleTTL:        5 * time.Minute,
+			RescanInterval: 0,
+			MaxInstances:   0,
+			Slots:          1,
+			Dirs:           []string{emptyDir},
+		})
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -112,7 +142,17 @@ func TestRunServer_ScansConventionalDirsWithNoCLIDirs(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(ctx, "127.0.0.1:0", filepath.Join(fakeHome, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1)
+		errCh <- runServer(ctx, serverOptions{
+			Addr:           "127.0.0.1:0",
+			CachePath:      filepath.Join(fakeHome, "tuning.json"),
+			ConfigPath:     "",
+			Budget:         2 * time.Minute,
+			IdleTTL:        5 * time.Minute,
+			RescanInterval: 0,
+			MaxInstances:   0,
+			Slots:          1,
+			Dirs:           nil,
+		})
 	}()
 
 	time.Sleep(50 * time.Millisecond)

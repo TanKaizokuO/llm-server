@@ -33,6 +33,18 @@ func main() {
 	}
 }
 
+type serverOptions struct {
+	Addr           string
+	CachePath      string
+	ConfigPath     string
+	Budget         time.Duration
+	IdleTTL        time.Duration
+	RescanInterval time.Duration
+	MaxInstances   int
+	Slots          int
+	Dirs           []string
+}
+
 func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 	if len(args) > 1 && args[1] == "inspect" {
 		return runInspect(args[2:], stdout)
@@ -54,7 +66,18 @@ func runCLI(parentCtx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	return runServer(parentCtx, *addr, *cachePath, *configPath, *budget, *idleTTL, *rescanInterval, *maxInstances, *slots, fs.Args()...)
+	opts := serverOptions{
+		Addr:           *addr,
+		CachePath:      *cachePath,
+		ConfigPath:     *configPath,
+		Budget:         *budget,
+		IdleTTL:        *idleTTL,
+		RescanInterval: *rescanInterval,
+		MaxInstances:   *maxInstances,
+		Slots:          *slots,
+		Dirs:           fs.Args(),
+	}
+	return runServer(parentCtx, opts)
 }
 
 func runInspect(args []string, stdout io.Writer) error {
@@ -95,22 +118,22 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, addr, cachePath, configPath string, budget, idleTTL, rescanInterval time.Duration, maxInstances, slots int, dirs ...string) error {
-	scanDirs := make([]string, 0, len(dirs))
-	scanDirs = append(scanDirs, dirs...)
-	if len(dirs) == 0 {
+func runServer(parentCtx context.Context, opts serverOptions) error {
+	scanDirs := make([]string, 0, len(opts.Dirs))
+	scanDirs = append(scanDirs, opts.Dirs...)
+	if len(opts.Dirs) == 0 {
 		scanDirs = append(scanDirs, supervisor.ConventionalModelDirs()...)
 	}
 
 	h := host.New()
 	sup, err := supervisor.NewWithOpts(h, scanDirs,
-		supervisor.WithCachePath(cachePath),
-		supervisor.WithConfigFile(configPath),
-		supervisor.WithTuningBudget(budget),
-		supervisor.WithDefaultTTL(idleTTL),
-		supervisor.WithRescanInterval(rescanInterval),
-		supervisor.WithMaxInstances(maxInstances),
-		supervisor.WithSlotsPerInstance(slots),
+		supervisor.WithCachePath(opts.CachePath),
+		supervisor.WithConfigFile(opts.ConfigPath),
+		supervisor.WithTuningBudget(opts.Budget),
+		supervisor.WithDefaultTTL(opts.IdleTTL),
+		supervisor.WithRescanInterval(opts.RescanInterval),
+		supervisor.WithMaxInstances(opts.MaxInstances),
+		supervisor.WithSlots(opts.Slots),
 	)
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)
@@ -119,7 +142,7 @@ func runServer(parentCtx context.Context, addr, cachePath, configPath string, bu
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := httpserve.Listen(addr, sup.Handler())
+	srv, err := httpserve.Listen(opts.Addr, sup.Handler())
 	if err != nil {
 		return fmt.Errorf("initialising server: %w", err)
 	}
