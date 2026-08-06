@@ -88,16 +88,38 @@ func TestHealthReportsReadyWithNoModelLoaded(t *testing.T) {
 	}
 }
 
-func TestDiscovery_RefusesToStartWhenNoModelsFound(t *testing.T) {
+func TestDiscovery_StartsWithNoModels(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	_, err := supervisor.New(host.NewFakeHost(), tmpDir)
-	if err == nil {
-		t.Fatal("expected supervisor.New to fail on empty directory, got nil")
+	sup, err := supervisor.New(host.NewFakeHost(), tmpDir)
+	if err != nil {
+		t.Fatalf("expected supervisor.New to succeed on empty directory, got err: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	ts := httptest.NewServer(sup.Handler())
+	t.Cleanup(ts.Close)
+
+	// Check /api/tags
+	resp, err := http.Get(ts.URL + "/api/tags")
+	if err != nil {
+		t.Fatalf("GET /api/tags: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"models":[]}`+"\n" {
+		t.Errorf("GET /api/tags = %q, want %q", string(body), `{"models":[]}`+"\n")
 	}
 
-	if !strings.Contains(err.Error(), "no models found") {
-		t.Errorf("error message = %q, want containing 'no models found'", err.Error())
+	// Check /v1/models
+	resp, err = http.Get(ts.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ = io.ReadAll(resp.Body)
+	if string(body) != `{"object":"list","data":[]}`+"\n" {
+		t.Errorf("GET /v1/models = %q, want %q", string(body), `{"object":"list","data":[]}`+"\n")
 	}
 }
 

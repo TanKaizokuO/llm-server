@@ -478,7 +478,7 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 		return nil, err
 	}
 	if len(models) == 0 {
-		return nil, fmt.Errorf("no models found in scanned directories: %v", dirs)
+		slog.Warn("started with no models found", "dirs", dirs)
 	}
 
 	modelMap := make(map[string]Model, len(models))
@@ -722,13 +722,6 @@ func (s *Supervisor) resolveTunedOverride(m Model) (tunedConfig, bool) {
 // Rescan re-scans the Supervisor's configured directories for Models,
 // picking up newly added or removed GGUF files. It never restarts resident
 // Instances or requires a restart of the Supervisor itself.
-//
-// A scan that comes back empty after Models were already being served is
-// treated as a transient discovery failure (an unmounted drive, a network
-// share blip) rather than an instruction to stop serving everything: it is
-// logged and the existing Model list is left in place. Startup already
-// refuses to begin with zero Models, so an operator who genuinely empties
-// every scanned directory only sees that reflected after a restart.
 func (s *Supervisor) Rescan() error {
 	s.mu.RLock()
 	dirs := s.dirs
@@ -744,20 +737,29 @@ func (s *Supervisor) Rescan() error {
 		return err
 	}
 
-	if len(models) == 0 && hadModels {
-		slog.Warn("rescan found no models, keeping previous model list", "dirs", dirs)
-		return nil
-	}
 
 	modelMap := make(map[string]Model, len(models))
 	for _, m := range models {
 		modelMap[m.ID] = m
 	}
 
+	var orphaned []string
 	s.mu.Lock()
+	if hadModels {
+		for id := range s.models {
+			if _, ok := modelMap[id]; !ok {
+				orphaned = append(orphaned, id)
+			}
+		}
+	}
 	s.models = modelMap
 	s.modelsList = models
 	s.mu.Unlock()
+
+	for _, id := range orphaned {
+		_ = s.evictByID(context.Background(), id)
+	}
+
 	return nil
 }
 
@@ -813,8 +815,6 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rescan", s.handleV1Rescan)
 	return mux
 }
-
-// Evict stops and removes the resident Instance for the specified model reference if one exists.
 // It returns nil if no Instance was resident for the model.
 func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 	if ctx == nil {
@@ -824,8 +824,10 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	modelID := m.ID
+	return s.evictByID(ctx, m.ID)
+}
 
+func (s *Supervisor) evictByID(ctx context.Context, modelID string) error {
 	s.mu.Lock()
 	resInst, resident := s.instances[modelID]
 	if resident {

@@ -1,6 +1,7 @@
 package supervisor_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -120,17 +121,15 @@ func TestRescan_DisabledByZeroInterval(t *testing.T) {
 	}
 }
 
-// TestRescan_TransientEmptyScanKeepsPreviousModelList ensures a scan that
-// comes back empty after Models were already being served does not wipe
-// out the live Model list — discoverModels cannot distinguish "the
-// operator genuinely emptied the directory" from "a network mount blipped
-// for one scan", so Rescan conservatively keeps serving what it already
-// knew about until a restart.
-func TestRescan_TransientEmptyScanKeepsPreviousModelList(t *testing.T) {
+// TestRescan_DeletedModelEvictsInstance ensures a scan that comes back
+// without a previously served model will remove it from the list and
+// evict any running instance of it.
+func TestRescan_DeletedModelEvictsInstance(t *testing.T) {
 	tmpDir := t.TempDir()
 	modelPath := writeTestGGUF(t, tmpDir, "only-model.gguf", "llama", "Q4_K_M")
 
-	sup, err := supervisor.New(host.NewFakeHost(), tmpDir)
+	fakeHost := host.NewFakeHost()
+	sup, err := supervisor.New(fakeHost, tmpDir)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -140,15 +139,106 @@ func TestRescan_TransientEmptyScanKeepsPreviousModelList(t *testing.T) {
 		t.Fatalf("initial models = %v, want 1", ids)
 	}
 
+	// Start a generation to make the instance resident
+	body := []byte(`{"model":"only-model:q4_k_m","messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Generate status = %d, want 200", rr.Code)
+	}
+
+	instances := fakeHost.Instances()
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 running instance, got %d", len(instances))
+	}
+
+	// Now delete the model file
 	if err := os.Remove(modelPath); err != nil {
 		t.Fatalf("removing model file: %v", err)
 	}
+
+	// Rescan should discover the file is gone, remove the model, and evict the instance
+	if err := sup.Rescan(); err != nil {
+		t.Fatalf("Rescan failed: %v", err)
+	}
+
+	if ids := listedModelIDs(t, sup); len(ids) != 0 {
+		t.Fatalf("models after removing the file = %v, want 0", ids)
+	}
+
+	// The fake instance should be stopped.
+	// fakeHost.Instances() returns instances. Are they removed or marked stopped?
+	// The fakeHost usually doesn't clear the slice, but we can check the instance's state.
+	// But actually, we can check `/api/ps` to see if it's empty.
+	reqPs := httptest.NewRequest("GET", "/api/ps", nil)
+	rrPs := httptest.NewRecorder()
+	sup.Handler().ServeHTTP(rrPs, reqPs)
+	if rrPs.Code != http.StatusOK {
+		t.Fatalf("GET /api/ps status = %d", rrPs.Code)
+	}
+	if string(rrPs.Body.Bytes()) != `{"models":[]}`+"\n" {
+		t.Errorf("GET /api/ps = %q, want %q", string(rrPs.Body.Bytes()), `{"models":[]}`+"\n")
+	}
+}
+
+// TestRescan_StartsWithNoModels_OnDemand ensures a supervisor can start
+// with an empty directory and pick up a model dropped in later.
+func TestRescan_StartsWithNoModels_OnDemand(t *testing.T) {
+	tmpDir := t.TempDir()
+	sup, err := supervisor.New(host.NewFakeHost(), tmpDir)
+	if err != nil {
+		t.Fatalf("New failed on empty dir: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	if ids := listedModelIDs(t, sup); len(ids) != 0 {
+		t.Fatalf("initial models = %v, want 0", ids)
+	}
+
+	writeTestGGUF(t, tmpDir, "new-model.gguf", "llama", "Q4_K_M")
 
 	if err := sup.Rescan(); err != nil {
 		t.Fatalf("Rescan failed: %v", err)
 	}
 
 	if ids := listedModelIDs(t, sup); len(ids) != 1 {
-		t.Fatalf("models after a scan finding nothing = %v, want the previous 1 preserved", ids)
+		t.Fatalf("models after scan = %v, want 1", ids)
+	}
+}
+
+// TestRescan_StartsWithNoModels_Timer ensures the background timer works
+// correctly from a zero-model start.
+func TestRescan_StartsWithNoModels_Timer(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	fake := host.NewFakeHost()
+	// Short rescan interval
+	sup, err := supervisor.NewWithOpts(fake, []string{tmpDir}, supervisor.WithRescanInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewWithOpts failed on empty dir: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	if ids := listedModelIDs(t, sup); len(ids) != 0 {
+		t.Fatalf("initial models = %v, want 0", ids)
+	}
+
+	writeTestGGUF(t, tmpDir, "new-model.gguf", "llama", "Q4_K_M")
+
+	// Wait for the background timer to discover it
+	deadline := time.Now().Add(time.Second)
+	var found []string
+	for time.Now().Before(deadline) {
+		found = listedModelIDs(t, sup)
+		if len(found) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("models after waiting for timer = %v, want 1", found)
 	}
 }

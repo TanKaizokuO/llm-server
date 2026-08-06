@@ -66,15 +66,28 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	}
 }
 
-func TestRunServer_FailsWhenNoModelsFound(t *testing.T) {
+func TestRunServer_StartsWithNoModels(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	emptyDir := t.TempDir()
-	err := runServer(context.Background(), "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, emptyDir)
-	if err == nil {
-		t.Fatal("expected error when no models found, got nil")
-	}
-	if !strings.Contains(err.Error(), "no models found") {
-		t.Errorf("err = %v, want error containing 'no models found'", err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runServer(ctx, "127.0.0.1:0", filepath.Join(emptyDir, "tuning.json"), "", 2*time.Minute, 5*time.Minute, 0, 0, 1, emptyDir)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("runServer returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runServer did not exit after context cancellation")
 	}
 }
 
