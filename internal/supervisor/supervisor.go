@@ -613,11 +613,14 @@ func (s *Supervisor) loadConfig() error {
 			configTTL[ref] = d
 		}
 		for _, arg := range mc.Argv {
-			a := strings.ToLower(arg)
-			if a == "-m" || strings.HasPrefix(a, "--model") ||
-				a == "-c" || strings.HasPrefix(a, "--ctx-size") ||
-				a == "-ngl" || strings.HasPrefix(a, "--n-gpu-layers") ||
-				a == "-np" || strings.HasPrefix(a, "--parallel") {
+			if arg == "-m" || strings.HasPrefix(arg, "-m=") ||
+				arg == "--model" || strings.HasPrefix(arg, "--model=") ||
+				arg == "-c" || strings.HasPrefix(arg, "-c=") ||
+				arg == "--ctx-size" || strings.HasPrefix(arg, "--ctx-size=") ||
+				arg == "-ngl" || strings.HasPrefix(arg, "-ngl=") ||
+				arg == "--n-gpu-layers" || strings.HasPrefix(arg, "--n-gpu-layers=") ||
+				arg == "-np" || strings.HasPrefix(arg, "-np=") ||
+				arg == "--parallel" || strings.HasPrefix(arg, "--parallel=") {
 				return fmt.Errorf("config file %q: model %q: argv cannot override reserved flag %q", s.configPath, ref, arg)
 			}
 		}

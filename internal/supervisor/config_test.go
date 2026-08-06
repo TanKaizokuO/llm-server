@@ -323,8 +323,45 @@ func TestConfig_NoModelRequiresConfigEntry(t *testing.T) {
 // TestConfig_ArgvCannotOverrideReservedFlags ensures model config argv cannot
 // contain flags managed by the supervisor (-m, -c, -ngl, -np).
 func TestConfig_ArgvCannotOverrideReservedFlags(t *testing.T) {
-	reservedFlags := []string{"-m", "--model", "-c", "--ctx-size", "-ngl", "--n-gpu-layers", "-np", "--parallel"}
+	reservedFlags := []string{
+		"-m", "-m=foo",
+		"--model", "--model=foo",
+		"-c", "-c=4096",
+		"--ctx-size", "--ctx-size=4096",
+		"-ngl", "-ngl=99",
+		"--n-gpu-layers", "--n-gpu-layers=99",
+		"-np", "-np=4",
+		"--parallel", "--parallel=4",
+	}
 	for _, flag := range reservedFlags {
+		t.Run(flag, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
+			configPath := writeTestConfig(t, tmpDir, "config.json", fmt.Sprintf(`{
+				"models": {
+					"model:q4_k_m": {"argv": ["%s"]}
+				}
+			}`, flag))
+
+			_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
+			if err == nil {
+				t.Fatalf("expected NewWithOpts to fail when argv contains reserved flag %s, got nil error", flag)
+			}
+		})
+	}
+}
+
+// TestConfig_ArgvAllowedFlags ensures similarly-named but unreserved flags
+// (e.g. --model-draft, --parallel-slots) are accepted and reach the launch argv.
+func TestConfig_ArgvAllowedFlags(t *testing.T) {
+	allowedFlags := []string{
+		"--model-draft",
+		"--model-url",
+		"--models",
+		"--parallel-slots",
+		"--flash-attn",
+	}
+	for _, flag := range allowedFlags {
 		t.Run(flag, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
@@ -334,9 +371,38 @@ func TestConfig_ArgvCannotOverrideReservedFlags(t *testing.T) {
 				}
 			}`, flag))
 
-			_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
-			if err == nil {
-				t.Fatalf("expected NewWithOpts to fail when argv contains reserved flag %s", flag)
+			fake := host.NewFakeHost()
+			sup, err := supervisor.NewWithOpts(fake, []string{tmpDir}, supervisor.WithConfigFile(configPath))
+			if err != nil {
+				t.Fatalf("expected NewWithOpts to succeed with allowed flag %s, got err: %v", flag, err)
+			}
+			t.Cleanup(func() { _ = sup.Close() })
+			
+			body := []byte(`{"model":"model:q4_k_m","messages":[{"role":"user","content":"hi"}]}`)
+			req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+			rr := httptest.NewRecorder()
+			sup.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200. body: %s", rr.Code, rr.Body.String())
+			}
+
+			launches := fake.Launches()
+			if len(launches) == 0 {
+				t.Fatal("expected at least one launch")
+			}
+			
+			found := false
+			for _, argv := range launches {
+				for _, a := range argv {
+					if a == flag {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				t.Errorf("expected flag %q to be in launched argv. Launches: %v", flag, launches)
 			}
 		})
 	}
