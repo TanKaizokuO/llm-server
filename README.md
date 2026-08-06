@@ -23,9 +23,11 @@ CGO_ENABLED=0 go build -o llm-server ./cmd/llm-server
 ```
 
 With no directories given on the command line, the Supervisor still scans
-the conventional cache and data locations other local-LLM tools use (e.g.
-LM Studio's and GPT4All's model directories) — pointing it at nothing is a
-valid way to run it if a supported tool already manages your GGUF files.
+the conventional cache and data locations other local-LLM tools use: HuggingFace,
+LM Studio, GPT4All, and `llama.cpp`'s default cache. (It no longer scans the
+current directory `.` by default — point it at nothing, and it discovers what
+those tools downloaded; point it at `.` explicitly, and it scans your working
+directory).
 
 - `GET /health` reports readiness of the daemon itself.
 - `GET /api/tags` lists discovered Models in Ollama format.
@@ -61,6 +63,10 @@ name, path, or filename:
 - `tuned` pins the context length and offload verbatim, skipping empirical
   measurement entirely; it is never written to the Tuning cache.
 
+**Validation:** If the config file cannot be read, the Supervisor will fail to
+start. The Supervisor strictly manages `-m`, `--model`, `-c`, `--ctx-size`,
+`-ngl`, `--n-gpu-layers`, `-np`, and `--parallel`; specifying any of these
+reserved flags in a Model's `argv` will also fail startup.
 ## Tests
 
 ```sh

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"encoding/json"
 	"os"
 	"path/filepath"

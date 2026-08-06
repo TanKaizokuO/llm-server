@@ -44,9 +44,14 @@ var (
 )
 
 // ConventionalModelDirs returns the conventional cache and data locations
-// where other local-LLM tools (LM Studio, GPT4All) store GGUF files. The
-// zero-config path scans these alongside any directories given explicitly,
-// so an operator never needs a configuration entry just to be found.
+// where other local-LLM tools (HuggingFace, LM Studio, GPT4All, llama.cpp)
+// store GGUF files. The Supervisor scans these automatically when no directories
+// are given explicitly.
+//
+// The returned slice is ordered by precedence: explicit environment variables
+// (e.g. HF_HOME) win over defaults, followed by deterministic paths for each
+// tool. discoverModels keeps the first Model it sees for a given ID, so this
+// order resolves duplicates.
 func ConventionalModelDirs() []string {
 	var dirs []string
 	home, err := os.UserHomeDir()
@@ -54,10 +59,21 @@ func ConventionalModelDirs() []string {
 		return dirs
 	}
 
+	cacheRoot := xdgCacheHome(home)
+	dataRoot := xdgDataHome(home)
+
+	if hf := os.Getenv("HF_HOME"); hf != "" {
+		dirs = append(dirs, filepath.Join(hf, "hub"))
+	} else if hf := os.Getenv("HUGGINGFACE_HUB_CACHE"); hf != "" {
+		dirs = append(dirs, hf)
+	} else {
+		dirs = append(dirs, filepath.Join(cacheRoot, "huggingface", "hub"))
+	}
+
 	// LM Studio (modern & legacy) and llama.cpp default cache
 	dirs = append(dirs, filepath.Join(home, ".lmstudio", "models"))
-	dirs = append(dirs, filepath.Join(home, ".cache", "lm-studio", "models"))
-	dirs = append(dirs, filepath.Join(home, ".cache", "llama.cpp"))
+	dirs = append(dirs, filepath.Join(cacheRoot, "lm-studio", "models"))
+	dirs = append(dirs, filepath.Join(cacheRoot, "llama.cpp"))
 
 	switch runtime.GOOS {
 	case "darwin":
@@ -67,9 +83,23 @@ func ConventionalModelDirs() []string {
 			dirs = append(dirs, filepath.Join(appData, "nomic.ai", "GPT4All"))
 		}
 	default:
-		dirs = append(dirs, filepath.Join(home, ".local", "share", "nomic.ai", "GPT4All"))
+		dirs = append(dirs, filepath.Join(dataRoot, "nomic.ai", "GPT4All"))
 	}
 	return dirs
+}
+
+func xdgCacheHome(home string) string {
+	if cache := os.Getenv("XDG_CACHE_HOME"); cache != "" {
+		return cache
+	}
+	return filepath.Join(home, ".cache")
+}
+
+func xdgDataHome(home string) string {
+	if data := os.Getenv("XDG_DATA_HOME"); data != "" {
+		return data
+	}
+	return filepath.Join(home, ".local", "share")
 }
 
 // discoverModels recursively scans the given directories for valid GGUF models.
