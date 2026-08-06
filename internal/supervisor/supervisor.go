@@ -27,6 +27,26 @@ import (
 
 	"github.com/TanKaizokuO/llm-server/internal/host"
 )
+var managedFlags = []struct {
+	Short string
+	Long  string
+}{
+	{"-m", "--model"},
+	{"-c", "--ctx-size"},
+	{"-ngl", "--n-gpu-layers"},
+	{"-np", "--parallel"},
+}
+
+func isReservedFlag(arg string) bool {
+	for _, f := range managedFlags {
+		if arg == f.Short || strings.HasPrefix(arg, f.Short+"=") ||
+			arg == f.Long || strings.HasPrefix(arg, f.Long+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 
 type pendingInstance struct {
 	mu      sync.Mutex
@@ -283,7 +303,7 @@ type tunedConfig struct {
 	Offload uint64
 }
 
-// TunedConfig pins a Model's launch flags verbatim, bypassing empirical
+// TunedPin pins a Model's launch flags verbatim, bypassing empirical
 // measurement entirely. It is never written to the Tuning cache file: it is
 // a static override supplied by the operator, re-applied on every launch.
 //
@@ -292,7 +312,7 @@ type tunedConfig struct {
 // silently launching with the other flag at its zero value (CPU-only
 // offload, or an unusable zero-length context) with no measurement left to
 // correct it.
-type TunedConfig struct {
+type TunedPin struct {
 	CtxLen  *uint64 `json:"ctx_len"`
 	Offload *uint64 `json:"offload"`
 }
@@ -312,7 +332,7 @@ type ModelConfig struct {
 	Slots *int `json:"slots,omitempty"`
 	// Tuned pins this Model's context length and offload verbatim, skipping
 	// measurement entirely.
-	Tuned *TunedConfig `json:"tuned,omitempty"`
+	Tuned *TunedPin `json:"tuned,omitempty"`
 }
 
 // Config represents the optional configuration file's overrides. Config
@@ -613,25 +633,21 @@ func (s *Supervisor) loadConfig() error {
 			configTTL[ref] = d
 		}
 		for _, arg := range mc.Argv {
-			if arg == "-m" || strings.HasPrefix(arg, "-m=") ||
-				arg == "--model" || strings.HasPrefix(arg, "--model=") ||
-				arg == "-c" || strings.HasPrefix(arg, "-c=") ||
-				arg == "--ctx-size" || strings.HasPrefix(arg, "--ctx-size=") ||
-				arg == "-ngl" || strings.HasPrefix(arg, "-ngl=") ||
-				arg == "--n-gpu-layers" || strings.HasPrefix(arg, "--n-gpu-layers=") ||
-				arg == "-np" || strings.HasPrefix(arg, "-np=") ||
-				arg == "--parallel" || strings.HasPrefix(arg, "--parallel=") {
+			if isReservedFlag(arg) {
 				return fmt.Errorf("config file %q: model %q: argv cannot override reserved flag %q", s.configPath, ref, arg)
 			}
 		}
 		if mc.Slots != nil && *mc.Slots <= 0 {
 			return fmt.Errorf("config file %q: model %q: slots must be positive, got %d", s.configPath, ref, *mc.Slots)
 		}
-		if mc.Tuned != nil && (mc.Tuned.CtxLen == nil || mc.Tuned.Offload == nil) {
-			return fmt.Errorf("config file %q: model %q: tuned requires both ctx_len and offload", s.configPath, ref)
-		}
-		if mc.Tuned != nil && *mc.Tuned.CtxLen == 0 {
-			return fmt.Errorf("config file %q: model %q: tuned ctx_len must be positive", s.configPath, ref)
+		if mc.Tuned != nil {
+			if mc.Tuned.CtxLen == nil || mc.Tuned.Offload == nil {
+				return fmt.Errorf("config file %q: model %q: tuned requires both ctx_len and offload", s.configPath, ref)
+			}
+			if *mc.Tuned.CtxLen == 0 {
+				return fmt.Errorf("config file %q: model %q: tuned ctx_len must be positive", s.configPath, ref)
+			}
+			// Note: *mc.Tuned.Offload == 0 is deliberately legal (CPU-only pin).
 		}
 	}
 
@@ -1402,10 +1418,10 @@ func (s *Supervisor) evictAllResidentInstances() {
 func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunedConfig) (host.Instance, error) {
 	argv := []string{
 		"llama-server",
-		"-m", m.Path,
-		"-c", strconv.FormatUint(cfg.CtxLen, 10),
-		"-ngl", strconv.FormatUint(cfg.Offload, 10),
-		"-np", strconv.Itoa(s.resolveSlots(m)),
+		managedFlags[0].Short, m.Path,
+		managedFlags[1].Short, strconv.FormatUint(cfg.CtxLen, 10),
+		managedFlags[2].Short, strconv.FormatUint(cfg.Offload, 10),
+		managedFlags[3].Short, strconv.Itoa(s.resolveSlots(m)),
 	}
 	argv = append(argv, s.resolveArgv(m)...)
 
