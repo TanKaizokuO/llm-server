@@ -1513,6 +1513,29 @@ func TestSlots_ConfigurableAndPassedToChild(t *testing.T) {
 	}
 }
 
+// waitForOccupancy polls until the Instance for modelID reports wantActive of
+// wantMax Slots occupied, and fails if it never does.
+//
+// A Slot is released after the proxied response has been written, so a client
+// that has already read its response can briefly observe the previous count.
+// Reading occupancy once at that moment tests the scheduler, not the
+// Supervisor; a Slot that never comes back is the only real failure.
+func waitForOccupancy(t *testing.T, sup *supervisor.Supervisor, modelID string, wantActive, wantMax int) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		active, max, ok := sup.InstanceOccupancy(modelID)
+		if ok && active == wantActive && max == wantMax {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("occupancy = %d/%d (ok=%v), want %d/%d within 2s", active, max, ok, wantActive, wantMax)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestSlots_OccupancyTrackedAndWaitsWhenSlotsBusy(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "model-a.gguf", "llama", "Q4_K_M")
@@ -1604,10 +1627,7 @@ func TestSlots_OccupancyTrackedAndWaitsWhenSlotsBusy(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Request 2 timed out waiting for slot")
 	}
-	active, max, ok = sup.InstanceOccupancy("model-a:q4_k_m")
-	if !ok || active != 0 || max != 1 {
-		t.Fatalf("expected final occupancy 0/1, got %d/%d (ok=%v)", active, max, ok)
-	}
+	waitForOccupancy(t, sup, "model-a:q4_k_m", 0, 1)
 }
 
 func TestSlots_CancellingRequestFreesSlotPromptly(t *testing.T) {
@@ -1705,11 +1725,9 @@ func TestSlots_CancellingRequestFreesSlotPromptly(t *testing.T) {
 	}
 	resp3.Body.Close()
 
-	active, max, ok = sup.InstanceOccupancy("model-a:q4_k_m")
-	if !ok || active != 0 || max != 1 {
-		t.Fatalf("expected final occupancy 0/1, got %d/%d (ok=%v)", active, max, ok)
-	}
+	waitForOccupancy(t, sup, "model-a:q4_k_m", 0, 1)
 }
+
 func TestSupervisor_V1Completions(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "llama-3-8b.q4_k_m.gguf", "llama", "Q4_K_M")
