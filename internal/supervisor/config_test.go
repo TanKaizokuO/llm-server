@@ -25,12 +25,12 @@ func writeTestConfig(t *testing.T, dir, filename, contents string) string {
 	return path
 }
 
-// TestConfig_TunedOverridePinsFlagsAndSkipsMeasurement covers acceptance
+// TestConfig_PinFixesFlagsAndSkipsTuning covers acceptance
 // criteria: "A pinned tuned value bypasses measurement entirely and is used
 // verbatim." A single Launch call with exactly the pinned flags proves no
 // bisection ran, and the tuning cache stays empty since the pin is never
 // persisted there.
-func TestConfig_TunedOverridePinsFlagsAndSkipsMeasurement(t *testing.T) {
+func TestConfig_PinFixesFlagsAndSkipsTuning(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "pinned-model.gguf", "llama", "Q4_K_M")
 	configPath := writeTestConfig(t, tmpDir, "config.json", `{
@@ -204,11 +204,11 @@ func TestConfig_InvalidTTLFailsStartup(t *testing.T) {
 	}
 }
 
-// TestConfig_PartialTunedOverrideFailsStartup ensures a pin missing either
+// TestConfig_PartialPinFailsStartup ensures a pin missing either
 // field is rejected at load time rather than silently launching with the
 // other flag at its zero value (CPU-only offload, or an unusable
 // zero-length context) with no measurement left to correct it.
-func TestConfig_PartialTunedOverrideFailsStartup(t *testing.T) {
+func TestConfig_PartialPinFailsStartup(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "partial-pin-model.gguf", "llama", "Q4_K_M")
 	configPath := writeTestConfig(t, tmpDir, "config.json", `{
@@ -219,16 +219,17 @@ func TestConfig_PartialTunedOverrideFailsStartup(t *testing.T) {
 
 	_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
 	if err == nil {
-		t.Fatal("expected NewWithOpts to fail on a tuned override missing offload, got nil")
+		t.Fatal("expected NewWithOpts to fail on a pin missing offload, got nil")
 	}
-	if !strings.Contains(err.Error(), "tuned requires both ctx_len and offload") {
-		t.Errorf("error = %v, want containing 'tuned requires both ctx_len and offload'", err)
+	const want = `pin ("tuned") requires both ctx_len and offload`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want containing %q", err, want)
 	}
 }
 
-// TestConfig_ZeroCtxLenTunedOverrideFailsStartup ensures a pin cannot set an
+// TestConfig_ZeroCtxLenPinFailsStartup ensures a pin cannot set an
 // unusable zero-length context, even when both fields are present.
-func TestConfig_ZeroCtxLenTunedOverrideFailsStartup(t *testing.T) {
+func TestConfig_ZeroCtxLenPinFailsStartup(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "zero-ctx-model.gguf", "llama", "Q4_K_M")
 	configPath := writeTestConfig(t, tmpDir, "config.json", `{
@@ -246,10 +247,10 @@ func TestConfig_ZeroCtxLenTunedOverrideFailsStartup(t *testing.T) {
 	}
 }
 
-// TestConfig_TunedOverrideAllowsZeroOffload ensures a legitimate CPU-only
+// TestConfig_PinAllowsZeroOffload ensures a legitimate CPU-only
 // pin (offload explicitly 0, with both fields present) is accepted — only a
 // missing field or a zero context length is rejected.
-func TestConfig_TunedOverrideAllowsZeroOffload(t *testing.T) {
+func TestConfig_PinAllowsZeroOffload(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestGGUF(t, tmpDir, "cpu-only-model.gguf", "llama", "Q4_K_M")
 	configPath := writeTestConfig(t, tmpDir, "config.json", `{
@@ -323,31 +324,23 @@ func TestConfig_NoModelRequiresConfigEntry(t *testing.T) {
 // TestConfig_ArgvCannotOverrideReservedFlags ensures model config argv cannot
 // contain flags managed by the supervisor (-m, -c, -ngl, -np).
 func TestConfig_ArgvCannotOverrideReservedFlags(t *testing.T) {
-	reservedFlags := []string{
-		"-m", "-m=foo",
-		"--model", "--model=foo",
-		"-c", "-c=4096",
-		"--ctx-size", "--ctx-size=4096",
-		"-ngl", "-ngl=99",
-		"--n-gpu-layers", "--n-gpu-layers=99",
-		"-np", "-np=4",
-		"--parallel", "--parallel=4",
-	}
-	for _, flag := range reservedFlags {
-		t.Run(flag, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
-			configPath := writeTestConfig(t, tmpDir, "config.json", fmt.Sprintf(`{
-				"models": {
-					"model:q4_k_m": {"argv": ["%s"]}
+	for _, flag := range supervisor.ReservedFlags() {
+		cases := []string{flag, flag + "=value"}
+		for _, arg := range cases {
+			t.Run(arg, func(t *testing.T) {
+				tmpDir := t.TempDir()
+				writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
+				configPath := writeTestConfig(t, tmpDir, "config.json", fmt.Sprintf(`{
+					"models": {
+						"model:q4_k_m": {"argv": ["%s"]}
+					}
+				}`, arg))
+				_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
+				if err == nil {
+					t.Fatalf("expected NewWithOpts to fail when argv contains reserved flag %s, got nil error", arg)
 				}
-			}`, flag))
-
-			_, err := supervisor.NewWithOpts(host.NewFakeHost(), []string{tmpDir}, supervisor.WithConfigFile(configPath))
-			if err == nil {
-				t.Fatalf("expected NewWithOpts to fail when argv contains reserved flag %s, got nil error", flag)
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -377,7 +370,7 @@ func TestConfig_ArgvAllowedFlags(t *testing.T) {
 				t.Fatalf("expected NewWithOpts to succeed with allowed flag %s, got err: %v", flag, err)
 			}
 			t.Cleanup(func() { _ = sup.Close() })
-			
+
 			body := []byte(`{"model":"model:q4_k_m","messages":[{"role":"user","content":"hi"}]}`)
 			req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
 			rr := httptest.NewRecorder()
@@ -391,7 +384,7 @@ func TestConfig_ArgvAllowedFlags(t *testing.T) {
 			if len(launches) == 0 {
 				t.Fatal("expected at least one launch")
 			}
-			
+
 			found := false
 			for _, argv := range launches {
 				for _, a := range argv {

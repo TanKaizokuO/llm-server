@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +29,22 @@ func createTestModelFile(t *testing.T, dir, filename string) string {
 	return path
 }
 
+// defaultTestOpts returns runServer options that scan exactly dir, bind an
+// ephemeral port, and use no config file.
+func defaultTestOpts(dir string) serverOptions {
+	return serverOptions{
+		Addr:           "127.0.0.1:0",
+		CachePath:      filepath.Join(dir, "tuning.json"),
+		ConfigPath:     "",
+		Budget:         2 * time.Minute,
+		IdleTTL:        5 * time.Minute,
+		RescanInterval: 0,
+		MaxInstances:   0,
+		Slots:          1,
+		Dirs:           []string{dir},
+	}
+}
+
 func TestRunGracefulShutdownOnSignal(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
@@ -36,17 +52,7 @@ func TestRunGracefulShutdownOnSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(context.Background(), serverOptions{
-			Addr:           "127.0.0.1:0",
-			CachePath:      filepath.Join(tmpDir, "tuning.json"),
-			ConfigPath:     "",
-			Budget:         2 * time.Minute,
-			IdleTTL:        5 * time.Minute,
-			RescanInterval: 0,
-			MaxInstances:   0,
-			Slots:          1,
-			Dirs:           []string{tmpDir},
-		})
+		errCh <- runServer(context.Background(), defaultTestOpts(tmpDir))
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -71,17 +77,9 @@ func TestRunFailsOnInvalidAddress(t *testing.T) {
 	tmpDir := t.TempDir()
 	createTestModelFile(t, tmpDir, "test-model.gguf")
 
-	err := runServer(context.Background(), serverOptions{
-		Addr:           "invalid-address-format:99999999",
-		CachePath:      filepath.Join(tmpDir, "tuning.json"),
-		ConfigPath:     "",
-		Budget:         2 * time.Minute,
-		IdleTTL:        5 * time.Minute,
-		RescanInterval: 0,
-		MaxInstances:   0,
-		Slots:          1,
-		Dirs:           []string{tmpDir},
-	})
+	opts := defaultTestOpts(tmpDir)
+	opts.Addr = "invalid-address-format:99999999"
+	err := runServer(context.Background(), opts)
 	if err == nil {
 		t.Fatal("expected error on invalid address, got nil")
 	}
@@ -96,17 +94,7 @@ func TestRunServer_StartsWithNoModels(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(ctx, serverOptions{
-			Addr:           "127.0.0.1:0",
-			CachePath:      filepath.Join(emptyDir, "tuning.json"),
-			ConfigPath:     "",
-			Budget:         2 * time.Minute,
-			IdleTTL:        5 * time.Minute,
-			RescanInterval: 0,
-			MaxInstances:   0,
-			Slots:          1,
-			Dirs:           []string{emptyDir},
-		})
+		errCh <- runServer(ctx, defaultTestOpts(emptyDir))
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -122,49 +110,41 @@ func TestRunServer_StartsWithNoModels(t *testing.T) {
 	}
 }
 
-// TestRunServer_ScansConventionalDirsWithNoCLIDirs covers: "With no
-// configuration file the Supervisor scans conventional cache and data
-// locations plus any directories given on the command line." With zero CLI
-// dirs, a Model sitting only under a conventional cache directory must
-// still be discovered — proven by runServer not failing with "no models
-// found" even though no directory was passed on the command line.
-func TestRunServer_ScansConventionalDirsWithNoCLIDirs(t *testing.T) {
+func TestResolveScanDirs_NoCLIDirs(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	modelsDir := filepath.Join(fakeHome, ".cache", "lm-studio", "models")
-	if err := os.MkdirAll(modelsDir, 0755); err != nil {
-		t.Fatalf("creating conventional models dir: %v", err)
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HF_HOME", "")
+
+	resolved := resolveScanDirs(nil)
+	if len(resolved) == 0 {
+		t.Fatal("expected conventional dirs to be returned when explicit dirs are empty")
 	}
-	createTestModelFile(t, modelsDir, "conventional-model.gguf")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- runServer(ctx, serverOptions{
-			Addr:           "127.0.0.1:0",
-			CachePath:      filepath.Join(fakeHome, "tuning.json"),
-			ConfigPath:     "",
-			Budget:         2 * time.Minute,
-			IdleTTL:        5 * time.Minute,
-			RescanInterval: 0,
-			MaxInstances:   0,
-			Slots:          1,
-			Dirs:           nil,
-		})
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case err := <-errCh:
-		if err != nil && !strings.Contains(err.Error(), "context canceled") {
-			t.Errorf("runServer returned unexpected error: %v", err)
+	found := false
+	for _, d := range resolved {
+		if strings.Contains(d, ".cache") || strings.Contains(d, ".lmstudio") {
+			found = true
+			break
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("runServer did not exit after context cancellation")
+	}
+	if !found {
+		t.Errorf("conventional dirs not found in resolved: %v", resolved)
+	}
+}
+
+func TestResolveScanDirs_WithCLIDirs(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HF_HOME", "")
+
+	explicit := []string{"/my/custom/path"}
+	resolved := resolveScanDirs(explicit)
+
+	if len(resolved) != 1 || resolved[0] != "/my/custom/path" {
+		t.Fatalf("expected only explicit dir, got: %v", resolved)
 	}
 }
 func TestRunCLI_MaxInstancesFlag(t *testing.T) {

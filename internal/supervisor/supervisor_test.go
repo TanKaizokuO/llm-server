@@ -121,6 +121,27 @@ func TestDiscovery_StartsWithNoModels(t *testing.T) {
 	if string(body) != `{"object":"list","data":[]}`+"\n" {
 		t.Errorf("GET /v1/models = %q, want %q", string(body), `{"object":"list","data":[]}`+"\n")
 	}
+
+	// Check /health
+	resp, err = http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health returned %v, want 200", resp.StatusCode)
+	}
+
+	// Check 404 on generation
+	reqBody := strings.NewReader(`{"model":"any-model","prompt":"hi"}`)
+	resp, err = http.Post(ts.URL+"/api/generate", "application/json", reqBody)
+	if err != nil {
+		t.Fatalf("POST /api/generate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /api/generate returned %v, want 404", resp.StatusCode)
+	}
 }
 
 func TestDiscovery_RecursiveScanShardsProjectorsCorruptFiles(t *testing.T) {
@@ -1460,9 +1481,7 @@ func TestSlots_ConfigurableAndPassedToChild(t *testing.T) {
 	fakeHost := host.NewFakeHost()
 	writePreTunedCache(t, tmpDir, fakeHost, "model-a.gguf")
 
-	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
-		supervisor.WithSlots(4),
-	)
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithSlotsPerInstance(4))
 	if err != nil {
 		t.Fatalf("supervisor.NewWithOpts: %v", err)
 	}
@@ -1513,9 +1532,7 @@ func TestSlots_OccupancyTrackedAndWaitsWhenSlotsBusy(t *testing.T) {
 		}), nil
 	})
 
-	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
-		supervisor.WithSlots(1),
-	)
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithSlotsPerInstance(1))
 	if err != nil {
 		t.Fatalf("supervisor.NewWithOpts: %v", err)
 	}
@@ -1612,9 +1629,7 @@ func TestSlots_CancellingRequestFreesSlotPromptly(t *testing.T) {
 		}), nil
 	})
 
-	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir},
-		supervisor.WithSlots(1),
-	)
+	sup, err := supervisor.NewWithOpts(fakeHost, []string{tmpDir}, supervisor.WithSlotsPerInstance(1))
 	if err != nil {
 		t.Fatalf("supervisor.NewWithOpts: %v", err)
 	}

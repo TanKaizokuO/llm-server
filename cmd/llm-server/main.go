@@ -118,13 +118,18 @@ func runInspect(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runServer(parentCtx context.Context, opts serverOptions) error {
-	scanDirs := make([]string, 0, len(opts.Dirs))
-	scanDirs = append(scanDirs, opts.Dirs...)
-	if len(opts.Dirs) == 0 {
+func resolveScanDirs(explicitDirs []string) []string {
+	var scanDirs []string
+	if len(explicitDirs) > 0 {
+		scanDirs = append(scanDirs, explicitDirs...)
+	} else {
 		scanDirs = append(scanDirs, supervisor.ConventionalModelDirs()...)
 	}
+	return scanDirs
+}
 
+func runServer(parentCtx context.Context, opts serverOptions) error {
+	scanDirs := resolveScanDirs(opts.Dirs)
 	h := host.New()
 	sup, err := supervisor.NewWithOpts(h, scanDirs,
 		supervisor.WithCachePath(opts.CachePath),
@@ -133,7 +138,7 @@ func runServer(parentCtx context.Context, opts serverOptions) error {
 		supervisor.WithDefaultTTL(opts.IdleTTL),
 		supervisor.WithRescanInterval(opts.RescanInterval),
 		supervisor.WithMaxInstances(opts.MaxInstances),
-		supervisor.WithSlots(opts.Slots),
+		supervisor.WithSlotsPerInstance(opts.Slots),
 	)
 	if err != nil {
 		return fmt.Errorf("initialising supervisor: %w", err)

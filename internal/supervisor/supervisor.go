@@ -20,6 +20,7 @@ import (
 	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,26 +28,41 @@ import (
 
 	"github.com/TanKaizokuO/llm-server/internal/host"
 )
-var managedFlags = []struct {
-	Short string
-	Long  string
-}{
-	{"-m", "--model"},
-	{"-c", "--ctx-size"},
-	{"-ngl", "--n-gpu-layers"},
-	{"-np", "--parallel"},
+
+const (
+	flagModelShort      = "-m"
+	flagModelLong       = "--model"
+	flagCtxSizeShort    = "-c"
+	flagCtxSizeLong     = "--ctx-size"
+	flagNGPULayersShort = "-ngl"
+	flagNGPULayersLong  = "--n-gpu-layers"
+	flagParallelShort   = "-np"
+	flagParallelLong    = "--parallel"
+)
+
+// reservedFlags are the llama-server flags the Supervisor computes itself
+// (Model path, Tunable Flags, and Slot count), so a config file may never
+// supply them.
+var reservedFlags = []string{
+	flagModelShort, flagModelLong,
+	flagCtxSizeShort, flagCtxSizeLong,
+	flagNGPULayersShort, flagNGPULayersLong,
+	flagParallelShort, flagParallelLong,
+}
+
+// ReservedFlags returns the flags a config file's argv may not override.
+func ReservedFlags() []string {
+	return slices.Clone(reservedFlags)
 }
 
 func isReservedFlag(arg string) bool {
-	for _, f := range managedFlags {
-		if arg == f.Short || strings.HasPrefix(arg, f.Short+"=") ||
-			arg == f.Long || strings.HasPrefix(arg, f.Long+"=") {
+	for _, f := range reservedFlags {
+		if arg == f || strings.HasPrefix(arg, f+"=") {
 			return true
 		}
 	}
 	return false
 }
-
 
 type pendingInstance struct {
 	mu      sync.Mutex
@@ -223,11 +239,16 @@ func (ri *residentInstance) stopTimerAndMarkStopped() {
 	ri.idleCond.Broadcast()
 }
 
-func (ri *residentInstance) drainAndStop(s *Supervisor, reason string) {
+// drainAndStop waits for in-flight requests to finish, unregisters the
+// Instance, and stops the child process. It returns the error from stopping
+// the process, so callers can report an Instance that outlived its Model —
+// the ghost-process case ADR-0001 exists to prevent. A drain that finds the
+// Instance already stopped is a no-op and returns nil.
+func (ri *residentInstance) drainAndStop(ctx context.Context, s *Supervisor, reason string) error {
 	ri.mu.Lock()
 	if ri.stopped {
 		ri.mu.Unlock()
-		return
+		return nil
 	}
 	if ri.idleTimer != nil && ri.timerActive {
 		ri.idleTimer.Stop()
@@ -243,7 +264,7 @@ func (ri *residentInstance) drainAndStop(s *Supervisor, reason string) {
 
 	if ri.stopped {
 		ri.mu.Unlock()
-		return
+		return nil
 	}
 	ri.stopped = true
 	ri.mu.Unlock()
@@ -254,8 +275,16 @@ func (ri *residentInstance) drainAndStop(s *Supervisor, reason string) {
 	}
 	s.mu.Unlock()
 
-	slog.Info("resident instance stopped", "model", ri.modelID, "reason", reason)
-	_ = stopInstance(context.Background(), ri.inst, 10*time.Second)
+	slog.Info("draining and stopping instance", "model_id", ri.modelID, "reason", reason)
+	return stopInstance(ctx, ri.inst, 10*time.Second)
+}
+
+// logDrainFailure reports a drain error from a call site that has no caller to
+// return it to.
+func logDrainFailure(modelID, reason string, err error) {
+	if err != nil {
+		slog.Warn("failed to stop instance", "model_id", modelID, "reason", reason, "err", err)
+	}
 }
 
 func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
@@ -267,7 +296,7 @@ func (s *Supervisor) onInstanceIdleTimeout(ri *residentInstance) {
 	ri.timerActive = false
 	ri.mu.Unlock()
 
-	ri.drainAndStop(s, "idle TTL expired")
+	logDrainFailure(ri.modelID, "idle TTL expired", ri.drainAndStop(context.Background(), s, "idle TTL expired"))
 }
 
 func stopInstance(ctx context.Context, inst host.Instance, timeout time.Duration) error {
@@ -298,21 +327,31 @@ type TuningCacheFile struct {
 	Entries     map[string]TuningEntry `json:"entries"`
 }
 
-type tunedConfig struct {
+// tunableFlags is the pair of launch dimensions Tuning searches over: context
+// length and GPU offload. It deliberately carries no provenance — the same
+// value may originate from a Tuning result, an operator Pin, a binary-search
+// candidate, or a fallback — so it states what will be launched, never how it
+// was arrived at.
+type tunableFlags struct {
 	CtxLen  uint64
 	Offload uint64
 }
 
-// TunedPin pins a Model's launch flags verbatim, bypassing empirical
-// measurement entirely. It is never written to the Tuning cache file: it is
-// a static override supplied by the operator, re-applied on every launch.
+// TuningPin is a Pin: Tunable Flags supplied by the operator and applied
+// verbatim on every launch, bypassing Tuning entirely. A Pin is never written
+// to the Tuning cache and is not scoped to a Fingerprint, so it survives a
+// hardware change unchanged and the operator owns its correctness.
+//
+// The wire key stays "tuned" for compatibility with existing config files.
+// See CONTEXT.md for why a Pin is deliberately not called "tuned": it is
+// precisely the value that was never measured.
 //
 // Both fields are required together: json.Unmarshal leaves a missing field
-// nil rather than zero, so loadConfig can reject a partial pin instead of
+// nil rather than zero, so loadConfig can reject a partial Pin instead of
 // silently launching with the other flag at its zero value (CPU-only
 // offload, or an unusable zero-length context) with no measurement left to
 // correct it.
-type TunedPin struct {
+type TuningPin struct {
 	CtxLen  *uint64 `json:"ctx_len"`
 	Offload *uint64 `json:"offload"`
 }
@@ -330,9 +369,9 @@ type ModelConfig struct {
 	TTL string `json:"ttl,omitempty"`
 	// Slots overrides the default Slot count for this Model.
 	Slots *int `json:"slots,omitempty"`
-	// Tuned pins this Model's context length and offload verbatim, skipping
-	// measurement entirely.
-	Tuned *TunedPin `json:"tuned,omitempty"`
+	// Pin fixes this Model's Tunable Flags verbatim, skipping Tuning
+	// entirely. Its wire key stays "tuned" for compatibility.
+	Pin *TuningPin `json:"tuned,omitempty"`
 }
 
 // Config represents the optional configuration file's overrides. Config
@@ -424,11 +463,6 @@ func WithSlotsPerInstance(n int) Option {
 	}
 }
 
-// WithSlots is an alias for WithSlotsPerInstance.
-func WithSlots(n int) Option {
-	return WithSlotsPerInstance(n)
-}
-
 // Supervisor is the daemon's root object. It owns Model discovery, the HTTP surface,
 // the Instance registry, and the Tuning cache.
 type Supervisor struct {
@@ -456,8 +490,6 @@ type Supervisor struct {
 	configTTL            map[string]time.Duration
 	dirs                 []string
 	rescanInterval       time.Duration
-	rescanStop           chan struct{}
-	rescanStopOnce       sync.Once
 	rescanCtx            context.Context
 	rescanCancel         context.CancelFunc
 	rescanWG             sync.WaitGroup
@@ -509,7 +541,6 @@ func NewWithOpts(h host.Host, dirs []string, opts ...Option) (*Supervisor, error
 		slotsPerInstance: 1,
 		dirs:             dirs,
 		rescanInterval:   30 * time.Second,
-		rescanStop:       make(chan struct{}),
 	}
 	s.rescanCtx, s.rescanCancel = context.WithCancel(context.Background())
 	for _, opt := range opts {
@@ -644,14 +675,14 @@ func (s *Supervisor) loadConfig() error {
 		if mc.Slots != nil && *mc.Slots <= 0 {
 			return fmt.Errorf("config file %q: model %q: slots must be positive, got %d", s.configPath, ref, *mc.Slots)
 		}
-		if mc.Tuned != nil {
-			if mc.Tuned.CtxLen == nil || mc.Tuned.Offload == nil {
-				return fmt.Errorf("config file %q: model %q: tuned requires both ctx_len and offload", s.configPath, ref)
+		if mc.Pin != nil {
+			if mc.Pin.CtxLen == nil || mc.Pin.Offload == nil {
+				return fmt.Errorf("config file %q: model %q: pin (%q) requires both ctx_len and offload", s.configPath, ref, "tuned")
 			}
-			if *mc.Tuned.CtxLen == 0 {
-				return fmt.Errorf("config file %q: model %q: tuned ctx_len must be positive", s.configPath, ref)
+			if *mc.Pin.CtxLen == 0 {
+				return fmt.Errorf("config file %q: model %q: pin (%q) ctx_len must be positive", s.configPath, ref, "tuned")
 			}
-			// Note: *mc.Tuned.Offload == 0 is deliberately legal (CPU-only pin).
+			// Note: *mc.Pin.Offload == 0 is deliberately legal (CPU-only pin).
 		}
 	}
 
@@ -688,12 +719,6 @@ func (s *Supervisor) resolveModelConfig(m Model) (ModelConfig, bool) {
 	return lookupByModelKeys(m, s.config.Models)
 }
 
-// resolveConfigTTL returns m's configured TTL override, pre-parsed and
-// validated once by loadConfig rather than re-parsed on every call.
-func (s *Supervisor) resolveConfigTTL(m Model) (time.Duration, bool) {
-	return lookupByModelKeys(m, s.configTTL)
-}
-
 // resolveSlots returns m's configured Slot count, falling back to the
 // Supervisor-wide default.
 func (s *Supervisor) resolveSlots(m Model) int {
@@ -711,25 +736,26 @@ func (s *Supervisor) resolveArgv(m Model) []string {
 	return nil
 }
 
-// resolveTunedOverride returns m's pinned Tuned configuration, if the
-// operator configured one. A pinned value bypasses measurement entirely and
-// is never written to the Tuning cache file. loadConfig already rejected
-// any config where Tuned is set but CtxLen or Offload is nil, so both
-// pointers are safe to dereference here.
-func (s *Supervisor) resolveTunedOverride(m Model) (tunedConfig, bool) {
-	if mc, ok := s.resolveModelConfig(m); ok && mc.Tuned != nil {
-		return tunedConfig{CtxLen: *mc.Tuned.CtxLen, Offload: *mc.Tuned.Offload}, true
+// resolvePin returns the Tunable Flags m is pinned to, if the operator
+// configured a Pin. loadConfig already rejected any config where the Pin is
+// set but CtxLen or Offload is nil, so both pointers are safe to dereference
+// here.
+func (s *Supervisor) resolvePin(m Model) (tunableFlags, bool) {
+	if mc, ok := s.resolveModelConfig(m); ok && mc.Pin != nil {
+		return tunableFlags{CtxLen: *mc.Pin.CtxLen, Offload: *mc.Pin.Offload}, true
 	}
-	return tunedConfig{}, false
+	return tunableFlags{}, false
 }
+
 // Rescan re-scans the Supervisor's configured directories for Models,
 // picking up newly added or removed GGUF files. It never restarts resident
-// Instances or requires a restart of the Supervisor itself.
+// Instances or requires a restart of the Supervisor itself. An empty result
+// from the scan is considered a legitimate state and replaces the existing
+// registry, subsequently evicting any orphaned Instances.
 func (s *Supervisor) Rescan(ctx context.Context) error {
 	s.mu.RLock()
 	dirs := s.dirs
 	closed := s.closed
-	hadModels := len(s.modelsList) > 0
 	s.mu.RUnlock()
 	if closed {
 		return errors.New("supervisor is closed")
@@ -751,11 +777,9 @@ func (s *Supervisor) Rescan(ctx context.Context) error {
 		s.mu.Unlock()
 		return errors.New("supervisor is closed")
 	}
-	if hadModels {
-		for id := range s.models {
-			if _, ok := modelMap[id]; !ok {
-				orphaned = append(orphaned, id)
-			}
+	for id := range s.models {
+		if _, ok := modelMap[id]; !ok {
+			orphaned = append(orphaned, id)
 		}
 	}
 	s.models = modelMap
@@ -763,7 +787,9 @@ func (s *Supervisor) Rescan(ctx context.Context) error {
 	s.mu.Unlock()
 
 	for _, id := range orphaned {
-		_ = s.evictByID(context.Background(), id)
+		if err := s.evictByID(ctx, id, "orphaned from rescan"); err != nil {
+			slog.Warn("failed to evict orphaned model", "model_id", id, "err", err)
+		}
 	}
 
 	return nil
@@ -772,9 +798,6 @@ func (s *Supervisor) Rescan(ctx context.Context) error {
 // startRescanTimer launches the background goroutine that calls Rescan on
 // s.rescanInterval, until Close stops it.
 func (s *Supervisor) startRescanTimer() {
-	if s.rescanInterval == 0 {
-		return
-	}
 	ticker := time.NewTicker(s.rescanInterval)
 	s.rescanWG.Add(1)
 	go func() {
@@ -786,7 +809,7 @@ func (s *Supervisor) startRescanTimer() {
 				if err := s.Rescan(s.rescanCtx); err != nil {
 					slog.Warn("periodic rescan failed", "err", err)
 				}
-			case <-s.rescanStop:
+			case <-s.rescanCtx.Done():
 				return
 			}
 		}
@@ -796,10 +819,9 @@ func (s *Supervisor) startRescanTimer() {
 // stopRescanTimer signals the background rescan goroutine to exit. Safe to
 // call multiple times or when no timer was started.
 func (s *Supervisor) stopRescanTimer() {
-	s.rescanStopOnce.Do(func() {
-		close(s.rescanStop)
+	if s.rescanCancel != nil {
 		s.rescanCancel()
-	})
+	}
 }
 
 // Handler returns the Supervisor's HTTP router. This is the single router the
@@ -825,8 +847,12 @@ func (s *Supervisor) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rescan", s.handleV1Rescan)
 	mux.HandleFunc("POST /api/tuning/reset", s.handleV1TuningReset)
 	mux.HandleFunc("DELETE /api/tuning", s.handleV1TuningReset)
+	mux.HandleFunc("DELETE /v1/tuning", s.handleV1TuningReset)
+	mux.HandleFunc("GET /api/tuning", s.handleV1TuningGet)
 	return mux
 }
+
+// Evict stops and removes the resident Instance for the specified model reference if one exists.
 // It returns nil if no Instance was resident for the model.
 func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 	if ctx == nil {
@@ -836,50 +862,46 @@ func (s *Supervisor) Evict(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	return s.evictByID(ctx, m.ID)
+	return s.evictByID(ctx, m.ID, "API eviction")
 }
 
-func (s *Supervisor) evictByID(ctx context.Context, modelID string) error {
+// evictByID stops the Instance for modelID, whether it is already resident or
+// still loading. Cancelling a pending load is not enough on its own: the load
+// can win the race and register its Instance after the sample below, so the
+// caller must also wait for the load to settle and drain whatever it left —
+// otherwise the Instance outlives its Model as a ghost process (ADR-0001 §3).
+func (s *Supervisor) evictByID(ctx context.Context, modelID string, reason string) error {
 	s.mu.Lock()
 	resInst, resident := s.instances[modelID]
-	if resident {
-		delete(s.instances, modelID)
-		resInst.stopTimerAndMarkStopped()
-	}
 	req, loading := s.loading[modelID]
 	if loading && req != nil && req.cancel != nil {
 		req.cancel()
 	}
 	s.mu.Unlock()
 
-	var stopErr error
+	var err error
 	if resident {
-		stopErr = stopInstance(ctx, resInst.inst, 10*time.Second)
+		err = resInst.drainAndStop(ctx, s, reason)
 	}
 
 	if loading && req != nil {
 		select {
 		case <-req.ready:
 			s.mu.Lock()
-			loadedResInst, loadedOk := s.instances[modelID]
-			if loadedOk {
-				delete(s.instances, modelID)
-				loadedResInst.stopTimerAndMarkStopped()
-			}
+			loaded, ok := s.instances[modelID]
 			s.mu.Unlock()
-			if loadedOk && loadedResInst != nil {
-				if err := stopInstance(ctx, loadedResInst.inst, 10*time.Second); err != nil && stopErr == nil {
-					stopErr = err
+			if ok && loaded != nil {
+				if drainErr := loaded.drainAndStop(ctx, s, reason); drainErr != nil && err == nil {
+					err = drainErr
 				}
 			}
 		case <-ctx.Done():
-			if stopErr == nil {
-				stopErr = ctx.Err()
+			if err == nil {
+				err = ctx.Err()
 			}
 		}
 	}
-
-	return stopErr
+	return err
 }
 
 // Close stops all resident Instances supervised by the daemon.
@@ -901,7 +923,7 @@ func (s *Supervisor) Close() error {
 	s.mu.Unlock()
 
 	var errs []error
-	
+
 	rescanWait := make(chan struct{})
 	go func() {
 		s.rescanWG.Wait()
@@ -1191,13 +1213,15 @@ func (s *Supervisor) resolveTTLLocked(modelID string) time.Duration {
 	if ttl, ok := s.modelTTLs[modelID]; ok {
 		return ttl
 	}
-	if m, ok := s.models[modelID]; ok {
-		if ttl, ok := lookupByModelKeys(m, s.modelTTLs); ok {
-			return ttl
-		}
-		if ttl, ok := s.resolveConfigTTL(m); ok {
-			return ttl
-		}
+	m, ok := s.models[modelID]
+	if !ok {
+		return s.defaultTTL
+	}
+	if ttl, ok := lookupByModelKeys(m, s.modelTTLs); ok {
+		return ttl
+	}
+	if ttl, ok := lookupByModelKeys(m, s.configTTL); ok {
+		return ttl
 	}
 	return s.defaultTTL
 }
@@ -1422,7 +1446,9 @@ func (s *Supervisor) evictLRULocked() {
 			lruInst.timerActive = false
 		}
 		lruInst.mu.Unlock()
-		go lruInst.drainAndStop(s, "evicted by LRU cap")
+		go func() {
+			logDrainFailure(lruInst.modelID, "evicted by LRU cap", lruInst.drainAndStop(context.Background(), s, "evicted by LRU cap"))
+		}()
 	}
 }
 
@@ -1441,13 +1467,13 @@ func (s *Supervisor) evictAllResidentInstances() {
 	}
 }
 
-func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunedConfig) (host.Instance, error) {
+func (s *Supervisor) launchConfig(loadCtx context.Context, m Model, cfg tunableFlags) (host.Instance, error) {
 	argv := []string{
 		"llama-server",
-		managedFlags[0].Short, m.Path,
-		managedFlags[1].Short, strconv.FormatUint(cfg.CtxLen, 10),
-		managedFlags[2].Short, strconv.FormatUint(cfg.Offload, 10),
-		managedFlags[3].Short, strconv.Itoa(s.resolveSlots(m)),
+		flagModelShort, m.Path,
+		flagCtxSizeShort, strconv.FormatUint(cfg.CtxLen, 10),
+		flagNGPULayersShort, strconv.FormatUint(cfg.Offload, 10),
+		flagParallelShort, strconv.Itoa(s.resolveSlots(m)),
 	}
 	argv = append(argv, s.resolveArgv(m)...)
 
@@ -1524,7 +1550,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 		if ctxLen < fallbackCtx {
 			fallbackCtx = ctxLen
 		}
-		fallbackCfg := tunedConfig{CtxLen: fallbackCtx, Offload: 0}
+		fallbackCfg := tunableFlags{CtxLen: fallbackCtx, Offload: 0}
 
 		launchCtx := loadCtx
 		if launchCtx.Err() != nil {
@@ -1567,7 +1593,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 			return fallback(budgetCtx.Err().Error())
 		}
 
-		cfg := tunedConfig{CtxLen: currentCtx, Offload: maxOffload}
+		cfg := tunableFlags{CtxLen: currentCtx, Offload: maxOffload}
 		s.mu.Lock()
 		s.tuningCurrentCtx = cfg.CtxLen
 		s.tuningCurrentOffload = cfg.Offload
@@ -1608,7 +1634,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 
 		low := 0
 		high := int(maxOffload) - 1
-		var bestCfg tunedConfig
+		var bestCfg tunableFlags
 		var found bool
 
 		for low <= high {
@@ -1620,7 +1646,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 			}
 
 			mid := low + (high-low)/2
-			cfg = tunedConfig{CtxLen: currentCtx, Offload: uint64(mid)}
+			cfg = tunableFlags{CtxLen: currentCtx, Offload: uint64(mid)}
 			s.mu.Lock()
 			s.tuningCurrentCtx = cfg.CtxLen
 			s.tuningCurrentOffload = cfg.Offload
@@ -1689,7 +1715,7 @@ func (s *Supervisor) tune(loadCtx context.Context, m Model) (host.Instance, erro
 }
 
 func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Instance, error) {
-	if cfg, ok := s.resolveTunedOverride(m); ok {
+	if cfg, ok := s.resolvePin(m); ok {
 		return s.launchConfig(loadCtx, m, cfg)
 	}
 
@@ -1709,7 +1735,7 @@ func (s *Supervisor) launchInstance(loadCtx context.Context, m Model) (host.Inst
 			entry.ModelDigest == m.Digest &&
 			entry.RequestedCtx == reqCtx &&
 			entry.KVCacheType == "f16" {
-			cfg := tunedConfig{CtxLen: entry.ResultingCtx, Offload: entry.Offload}
+			cfg := tunableFlags{CtxLen: entry.ResultingCtx, Offload: entry.Offload}
 			return s.launchConfig(loadCtx, m, cfg)
 		}
 		s.mu.Lock()
@@ -1792,7 +1818,11 @@ func (s *Supervisor) handleV1TuningReset(w http.ResponseWriter, r *http.Request)
 			targetID = m.ID
 		}
 
-		_ = s.Evict(r.Context(), targetID)
+		// Evict can also fail to resolve targetID; either way the operator
+		// asked for a reset, so report and continue clearing the cache.
+		if err := s.Evict(r.Context(), targetID); err != nil {
+			slog.Warn("failed to evict instance during tuning reset", "model", targetID, "err", err)
+		}
 
 		s.mu.Lock()
 		delete(s.tuned, targetID)
@@ -1808,10 +1838,12 @@ func (s *Supervisor) handleV1TuningReset(w http.ResponseWriter, r *http.Request)
 
 	s.evictAllResidentInstances()
 
-	s.tuningMu.Lock()
+	s.mu.Lock()
 	s.tuned = make(map[string]TuningEntry)
-	_ = os.Remove(s.cachePath)
-	s.tuningMu.Unlock()
+	if s.cachePath != "" {
+		_ = os.Remove(s.cachePath)
+	}
+	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",

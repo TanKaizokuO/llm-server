@@ -91,10 +91,10 @@ func TestConventionalModelDirs_XDGAndHFOverrides(t *testing.T) {
 func TestConventionalModelDirs_Deterministic(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	
+
 	dirs1 := supervisor.ConventionalModelDirs()
 	dirs2 := supervisor.ConventionalModelDirs()
-	
+
 	if len(dirs1) != len(dirs2) {
 		t.Fatalf("length mismatch: %d != %d", len(dirs1), len(dirs2))
 	}
@@ -103,7 +103,7 @@ func TestConventionalModelDirs_Deterministic(t *testing.T) {
 			t.Errorf("order mismatch at index %d: %q != %q", i, dirs1[i], dirs2[i])
 		}
 	}
-	
+
 	// Check for duplicates
 	seen := make(map[string]bool)
 	for _, d := range dirs1 {

@@ -253,7 +253,7 @@ func (s *Supervisor) handleAPIEmbed(w http.ResponseWriter, r *http.Request) {
 		if resInst != nil {
 			defer func() {
 				release()
-				go resInst.drainAndStop(s, "keep_alive=0")
+				go resInst.drainAndStop(context.Background(), s, "keep_alive=0")
 			}()
 		} else {
 			defer release()
@@ -537,7 +537,7 @@ func (s *Supervisor) serveOllamaCompletion(
 		s.mu.Unlock()
 		if resInst != nil {
 			defer func() {
-				go resInst.drainAndStop(s, "keep_alive=0")
+				go resInst.drainAndStop(context.Background(), s, "keep_alive=0")
 			}()
 		}
 	}

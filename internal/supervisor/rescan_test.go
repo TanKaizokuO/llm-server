@@ -169,10 +169,8 @@ func TestRescan_DeletedModelEvictsInstance(t *testing.T) {
 		t.Fatalf("models after removing the file = %v, want 0", ids)
 	}
 
-	// The fake instance should be stopped.
-	// fakeHost.Instances() returns instances. Are they removed or marked stopped?
-	// The fakeHost usually doesn't clear the slice, but we can check the instance's state.
-	// But actually, we can check `/api/ps` to see if it's empty.
+	// The instance must be gone from the registry, not merely marked stopped;
+	// /api/ps is the observable surface that proves it.
 	reqPs := httptest.NewRequest("GET", "/api/ps", nil)
 	rrPs := httptest.NewRecorder()
 	sup.Handler().ServeHTTP(rrPs, reqPs)
@@ -182,6 +180,68 @@ func TestRescan_DeletedModelEvictsInstance(t *testing.T) {
 	if string(rrPs.Body.Bytes()) != `{"models":[]}`+"\n" {
 		t.Errorf("GET /api/ps = %q, want %q", string(rrPs.Body.Bytes()), `{"models":[]}`+"\n")
 	}
+}
+
+func TestRescan_DeletedModelDrainsInFlightRequest(t *testing.T) {
+	tmpDir := t.TempDir()
+	modelPath := writeTestGGUF(t, tmpDir, "only-model.gguf", "llama", "Q4_K_M")
+
+	fakeHost := host.NewFakeHost()
+	slowHandlerStarted := make(chan struct{})
+	slowHandlerRelease := make(chan struct{})
+
+	fakeHost.SetOnLaunch(func(argv []string) (http.Handler, error) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/chat/completions" {
+				close(slowHandlerStarted)
+				<-slowHandlerRelease
+			}
+			host.DefaultMockHandler(w, r)
+		})
+		return h, nil
+	})
+
+	sup, err := supervisor.New(fakeHost, tmpDir)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Close() })
+
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	respCh := make(chan *http.Response, 1)
+
+	go func() {
+		body := []byte(`{"model":"only-model:q4_k_m","messages":[{"role":"user","content":"hi"}]}`)
+		resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+		respCh <- resp
+	}()
+
+	<-slowHandlerStarted
+
+	if err := os.Remove(modelPath); err != nil {
+		t.Fatalf("removing model file: %v", err)
+	}
+
+	rescanDone := make(chan struct{})
+	go func() {
+		_ = sup.Rescan(context.Background())
+		close(rescanDone)
+	}()
+
+	// Ensure Rescan has blocked in evictByID
+	time.Sleep(50 * time.Millisecond)
+
+	// Unblock request
+	close(slowHandlerRelease)
+
+	resp := <-respCh
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Generate status = %d, want 200 (drain failed to complete successfully)", resp.StatusCode)
+	}
+
+	<-rescanDone
 }
 
 // TestRescan_StartsWithNoModels_OnDemand ensures a supervisor can start
@@ -213,7 +273,7 @@ func TestRescan_StartsWithNoModels_OnDemand(t *testing.T) {
 // correctly from a zero-model start.
 func TestRescan_StartsWithNoModels_Timer(t *testing.T) {
 	tmpDir := t.TempDir()
-	
+
 	fake := host.NewFakeHost()
 	// Short rescan interval
 	sup, err := supervisor.NewWithOpts(fake, []string{tmpDir}, supervisor.WithRescanInterval(10*time.Millisecond))
@@ -241,5 +301,53 @@ func TestRescan_StartsWithNoModels_Timer(t *testing.T) {
 
 	if len(found) != 1 {
 		t.Fatalf("models after waiting for timer = %v, want 1", found)
+	}
+}
+
+func TestRescan_ClosePromptly(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
+
+	fake := host.NewFakeHost()
+	sup, err := supervisor.NewWithOpts(fake, []string{tmpDir}, supervisor.WithRescanInterval(time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewWithOpts failed: %v", err)
+	}
+
+	// Wait long enough for at least one tick to fire
+	time.Sleep(10 * time.Millisecond)
+
+	start := time.Now()
+	err = sup.Close()
+	dur := time.Since(start)
+
+	if err != nil {
+		t.Errorf("Close() returned error: %v", err)
+	}
+	if dur > time.Second {
+		t.Errorf("Close() took too long: %v (expected <1s)", dur)
+	}
+}
+
+func TestRescan_AfterClose(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestGGUF(t, tmpDir, "model.gguf", "llama", "Q4_K_M")
+
+	fake := host.NewFakeHost()
+	sup, err := supervisor.New(fake, tmpDir)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	if err := sup.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	err = sup.Rescan(context.Background())
+	if err == nil {
+		t.Fatal("expected error calling Rescan after Close, got nil")
+	}
+	if err.Error() != "supervisor is closed" {
+		t.Errorf("expected 'supervisor is closed' error, got: %v", err)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -59,16 +58,14 @@ func ConventionalModelDirs() []string {
 		return dirs
 	}
 
-	cacheRoot := xdgCacheHome(home)
-	dataRoot := xdgDataHome(home)
+	cacheRoot := firstEnvOrDefault(filepath.Join(home, ".cache"), "XDG_CACHE_HOME")
+	dataRoot := firstEnvOrDefault(filepath.Join(home, ".local", "share"), "XDG_DATA_HOME")
 
-	if hf := os.Getenv("HF_HOME"); hf != "" {
-		dirs = append(dirs, filepath.Join(hf, "hub"))
-	} else if hf := os.Getenv("HUGGINGFACE_HUB_CACHE"); hf != "" {
-		dirs = append(dirs, hf)
-	} else {
-		dirs = append(dirs, filepath.Join(cacheRoot, "huggingface", "hub"))
+	hf := firstEnvOrDefault(filepath.Join(cacheRoot, "huggingface", "hub"), "HF_HOME", "HUGGINGFACE_HUB_CACHE")
+	if hfEnv := os.Getenv("HF_HOME"); hfEnv != "" && hf == hfEnv {
+		hf = filepath.Join(hf, "hub")
 	}
+	dirs = append(dirs, hf)
 
 	// LM Studio (modern & legacy) and llama.cpp default cache
 	dirs = append(dirs, filepath.Join(home, ".lmstudio", "models"))
@@ -88,18 +85,13 @@ func ConventionalModelDirs() []string {
 	return dirs
 }
 
-func xdgCacheHome(home string) string {
-	if cache := os.Getenv("XDG_CACHE_HOME"); cache != "" {
-		return cache
+func firstEnvOrDefault(defaultPath string, envs ...string) string {
+	for _, env := range envs {
+		if val := os.Getenv(env); val != "" {
+			return val
+		}
 	}
-	return filepath.Join(home, ".cache")
-}
-
-func xdgDataHome(home string) string {
-	if data := os.Getenv("XDG_DATA_HOME"); data != "" {
-		return data
-	}
-	return filepath.Join(home, ".local", "share")
+	return defaultPath
 }
 
 // discoverModels recursively scans the given directories for valid GGUF models.
@@ -119,9 +111,6 @@ func discoverModels(ctx context.Context, dirs []string) ([]Model, error) {
 
 		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
 				slog.Warn("failed to access path during model scan", "path", path, "err", err)
 				return nil
 			}

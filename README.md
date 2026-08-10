@@ -60,13 +60,21 @@ name, path, or filename:
 - `ttl` overrides the idle TTL for that Model.
 - `slots` overrides the Slot count for that Model.
 - `argv` is appended to the launch command the Supervisor computes.
-- `tuned` pins the context length and offload verbatim, skipping empirical
-  measurement entirely; it is never written to the Tuning cache.
+- `tuned` declares a **Pin**: it fixes the context length and offload verbatim,
+  skipping Tuning entirely. A Pin is never written to the Tuning cache and is
+  not scoped to a Fingerprint, so it is re-applied unchanged after a hardware
+  change. (The key is spelled `tuned` for compatibility; see `CONTEXT.md`.)
 
-**Validation:** If the config file cannot be read, the Supervisor will fail to
-start. The Supervisor strictly manages `-m`, `--model`, `-c`, `--ctx-size`,
-`-ngl`, `--n-gpu-layers`, `-np`, and `--parallel`; specifying any of these
-reserved flags in a Model's `argv` will also fail startup.
+**Validation:** The Supervisor fails at startup if:
+- The config file is unreadable or contains malformed JSON.
+- A `ttl` string cannot be parsed as a duration.
+- `slots` is less than 1.
+- `tuned` is present but missing either `ctx_len` or `offload`.
+- `tuned.ctx_len` is 0.
+- A Model's `argv` array contains any of the reserved flags (`-m`, `--model`, `-c`, `--ctx-size`, `-ngl`, `--n-gpu-layers`, `-np`, `--parallel`), in either the separate-value form (`--ctx-size 4096`) or the `=` form (`--ctx-size=4096`).
+
+An entry keyed to a Model that does not exist on disk is ignored and is not an error.
+
 ## Tests
 
 ```sh
