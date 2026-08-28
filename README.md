@@ -11,6 +11,29 @@ against real failure, and caching the answer against a hardware Fingerprint.
 See `CONTEXT.md` for the project's vocabulary and `docs/research/prior-art.md`
 for why this shape was chosen.
 
+## Architecture
+
+This is a concurrency and process-supervision exercise as much as an LLM
+wrapper. Concretely:
+
+- **`llama-server` process supervision** — each Model is a child process the
+  Supervisor starts, health-checks, and stops; `internal/host` abstracts the
+  real OS boundary behind `Host`/`Instance` interfaces, with a `FakeHost` used
+  for fast, deterministic unit tests.
+- **`sync.Cond`-gated slot admission** — concurrent requests against a Model
+  block on a `sync.Cond` until a slot frees up or the instance is draining,
+  rather than busy-polling (`internal/supervisor/supervisor.go`).
+- **Idle-TTL draining** — an instance with no active requests past its `ttl`
+  is drained and the underlying process stopped, freeing VRAM without an
+  explicit shutdown call.
+- **Reverse proxy** — `net/http/httputil.ReverseProxy` forwards
+  completion/embedding requests to the resident `llama-server` instance once
+  it is admitted.
+- **Race-detected tests** — `go test -race ./...` is the default suite; real
+  GPU hardware tests are isolated behind an `integration` build tag.
+- **ADRs** — architectural decisions (discovery and lifecycle policy) are
+  recorded under `docs/adr/`.
+
 ## Status
 
 **In active development.** Tickets #3–#19 (Supervisor bootstrap, GGUF metadata reader, model discovery, Model resolution, real Host supervision, Tuning convergence loop, Tuning result persistence, completion/embedding API surfaces, and configuration overrides) are complete.
