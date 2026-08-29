@@ -1,2 +1,8 @@
 /llm-server
 /dist/
+
+# Local agent/tooling config
+.omp/
+.claude/
+AGENTS.md
+CLAUDE.md
